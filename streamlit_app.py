@@ -1,4 +1,6 @@
 import hashlib
+import os
+import urllib.request
 
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageOps
@@ -7,7 +9,6 @@ from pdf2image import convert_from_bytes
 
 _NUMERAL_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
-TESSERACT_LANG = "ara"
 TESSERACT_OEM = "--oem 1"
 DEFAULT_DPI = 400
 MIN_DPI = 150
@@ -20,14 +21,55 @@ PSM_OPTIONS = {
 }
 
 # Two-pass OCR constants
-BORDER_PX = 100          # white padding added on all sides before OCR
-HEADER_CONTENT_MM = 20   # page content depth (from top) treated as header zone
-HEADER_CONF_MIN = 50     # minimum Tesseract word confidence to keep from header strip
+BORDER_PX = 100        # white padding added on all sides before OCR
+HEADER_CONTENT_MM = 20 # page content depth treated as header zone
+HEADER_CONF_MIN = 65   # minimum Tesseract word confidence to keep from header strip
+
+# Language model options — downloaded once and cached on disk
+TESSDATA_CACHE_DIR = os.path.expanduser("~/.tessdata_custom")
+LANG_MODELS: dict[str, dict] = {
+    "best": {
+        "label": "tessdata_best  (highest accuracy · ~14 MB · recommended)",
+        "url": "https://github.com/tesseract-ocr/tessdata_best/raw/main/ara.traineddata",
+        "filename": "ara.traineddata",
+        "lang": "ara",
+    },
+    "amiri": {
+        "label": "ara-amiri-3000  (fine-tuned Arabic numerals · ~10 MB)",
+        "url": "https://github.com/Shreeshrii/tessdata_shreetest/raw/master/ara-amiri-3000.traineddata",
+        "filename": "ara-amiri-3000.traineddata",
+        "lang": "ara-amiri-3000",
+    },
+    "standard": {
+        "label": "Standard  (apt-installed · fastest · no download)",
+        "url": None,
+        "filename": None,
+        "lang": "ara",
+    },
+}
+DEFAULT_MODEL = "best"
 
 
 @st.cache_data(show_spinner=False)
 def pdf_to_images(pdf_bytes: bytes, dpi: int) -> list:
     return convert_from_bytes(pdf_bytes, dpi=dpi)
+
+
+@st.cache_resource(show_spinner=False)
+def _ensure_model(model_key: str) -> tuple[str, str]:
+    """Download model traineddata if needed. Returns (tesseract_lang, tessdata_dir)."""
+    info = LANG_MODELS[model_key]
+    if info["url"] is None:
+        return info["lang"], ""
+    os.makedirs(TESSDATA_CACHE_DIR, exist_ok=True)
+    dest = os.path.join(TESSDATA_CACHE_DIR, info["filename"])
+    if not os.path.exists(dest):
+        try:
+            urllib.request.urlretrieve(info["url"], dest)
+        except Exception:
+            st.warning(f"Could not download {info['label']} — falling back to standard model.")
+            return LANG_MODELS["standard"]["lang"], ""
+    return info["lang"], TESSDATA_CACHE_DIR
 
 
 def preprocess_image(img: Image.Image) -> Image.Image:
@@ -41,17 +83,25 @@ def _header_strip_px(dpi: int) -> int:
     return BORDER_PX + int(HEADER_CONTENT_MM / 25.4 * dpi)
 
 
-def _ocr_strip_filtered(strip: Image.Image) -> str:
-    """OCR a narrow strip and return only words whose Tesseract confidence >= HEADER_CONF_MIN.
+def _build_config(psm: int, tessdata_dir: str) -> str:
+    parts = [TESSERACT_OEM, f"--psm {psm}"]
+    if tessdata_dir:
+        parts.append(f"--tessdata-dir {tessdata_dir}")
+    return " ".join(parts)
 
-    This filters decoration/noise artefacts (low confidence) while keeping real
+
+def _ocr_strip_filtered(strip: Image.Image, lang: str, tessdata_dir: str) -> str:
+    """OCR a narrow strip, returning only words with Tesseract confidence >= HEADER_CONF_MIN.
+
+    Filters decoration/noise artefacts (low confidence) while keeping real
     header text (high confidence), even when both appear in the same strip.
     """
+    config = _build_config(psm=6, tessdata_dir=tessdata_dir)
     try:
         data = pytesseract.image_to_data(
             strip,
-            lang=TESSERACT_LANG,
-            config=f"{TESSERACT_OEM} --psm 6",
+            lang=lang,
+            config=config,
             output_type=pytesseract.Output.DICT,
         )
     except pytesseract.TesseractError:
@@ -66,20 +116,20 @@ def _ocr_strip_filtered(strip: Image.Image) -> str:
     return "\n".join(" ".join(words) for words in line_words.values())
 
 
-def ocr_page(img: Image.Image, psm: int, dpi: int) -> str:
+def ocr_page(img: Image.Image, psm: int, dpi: int, lang: str, tessdata_dir: str) -> str:
     fill = 255 if img.mode == "L" else (255, 255, 255)
     padded = ImageOps.expand(img, border=BORDER_PX, fill=fill)
     strip_h = _header_strip_px(dpi)
 
     # Pass 1: header strip — confidence-filtered to remove decoration noise
     header_strip = padded.crop((0, 0, padded.width, strip_h))
-    header_text = _ocr_strip_filtered(header_strip).strip()
+    header_text = _ocr_strip_filtered(header_strip, lang, tessdata_dir).strip()
 
     # Pass 2: body — cropped below the header strip, processed with chosen PSM
     body_img = padded.crop((0, strip_h, padded.width, padded.height))
-    config = f"{TESSERACT_OEM} --psm {psm}"
+    config = _build_config(psm=psm, tessdata_dir=tessdata_dir)
     try:
-        body_text = pytesseract.image_to_string(body_img, lang=TESSERACT_LANG, config=config)
+        body_text = pytesseract.image_to_string(body_img, lang=lang, config=config)
         text = (header_text + "\n\n" + body_text) if header_text else body_text
         return text.translate(_NUMERAL_TABLE)
     except pytesseract.TesseractError as exc:
@@ -133,6 +183,17 @@ def render_page_result(
 def render_sidebar() -> tuple:
     with st.sidebar:
         st.header("Settings")
+        model_key = st.selectbox(
+            "Language model",
+            options=list(LANG_MODELS.keys()),
+            format_func=lambda k: LANG_MODELS[k]["label"],
+            index=list(LANG_MODELS.keys()).index(DEFAULT_MODEL),
+            help=(
+                "tessdata_best and ara-amiri-3000 are downloaded once (~10–14 MB) and "
+                "cached for the session. Both improve number and punctuation accuracy "
+                "over the standard apt-installed model."
+            ),
+        )
         dpi = st.slider(
             "Rendering DPI",
             min_value=MIN_DPI,
@@ -148,9 +209,8 @@ def render_sidebar() -> tuple:
             index=list(PSM_OPTIONS.keys()).index(DEFAULT_PSM),
             help=(
                 "Applies to the body region only. The page header is always extracted "
-                "separately via a confidence-filtered strip OCR, regardless of this setting. "
-                "PSM 4 gives the best body accuracy for single-column Arabic documents. "
-                "Use PSM 3 for multi-column layouts."
+                "separately via a confidence-filtered strip OCR. "
+                "PSM 4 gives the best body accuracy for single-column Arabic documents."
             ),
         )
         show_images = st.checkbox("Show page images", value=False)
@@ -159,15 +219,33 @@ def render_sidebar() -> tuple:
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
-    return dpi, psm, show_images, preprocess
+    return model_key, dpi, psm, show_images, preprocess
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    dpi, psm, show_images, preprocess = render_sidebar()
-    st.caption(f"Tesseract OCR · OEM 1 LSTM · header strip + PSM {psm} body · lang: ara")
+    model_key, dpi, psm, show_images, preprocess = render_sidebar()
+
+    # Resolve language model (downloads if needed)
+    info = LANG_MODELS[model_key]
+    needs_download = (
+        info["url"] is not None
+        and info["filename"] is not None
+        and not os.path.exists(os.path.join(TESSDATA_CACHE_DIR, info["filename"]))
+    )
+    if needs_download:
+        size_hint = info["label"].split("·")[1].strip()
+        with st.spinner(f"Downloading language model ({size_hint})…"):
+            lang, tessdata_dir = _ensure_model(model_key)
+    else:
+        lang, tessdata_dir = _ensure_model(model_key)
+
+    st.caption(
+        f"Tesseract OCR · OEM 1 LSTM · PSM {psm} · "
+        f"lang: {lang} · model: {info['label'].split('(')[0].strip()}"
+    )
 
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)",
@@ -187,11 +265,11 @@ def main() -> None:
 
     for file_idx, file_obj in enumerate(uploaded_files):
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}"
 
         if cache_key not in st.session_state["results"]:
             try:
-                with st.spinner(f"Rendering pages for {file_obj.name}..."):
+                with st.spinner(f"Rendering pages for {file_obj.name}…"):
                     images = pdf_to_images(pdf_bytes, dpi)
             except Exception as exc:
                 st.error(f"Failed to render '{file_obj.name}': {exc}")
@@ -203,7 +281,7 @@ def main() -> None:
 
             for i, img in enumerate(images):
                 work_img = preprocess_image(img) if preprocess else img
-                page_texts.append(ocr_page(work_img, psm, dpi))
+                page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir))
                 progress_bar.progress(
                     (i + 1) / total_pages,
                     text=f"OCR: page {i + 1} of {total_pages}",
