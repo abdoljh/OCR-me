@@ -9,9 +9,9 @@ _NUMERAL_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 TESSERACT_LANG = "ara"
 TESSERACT_CONFIG = "--oem 1 --psm 3"
-DEFAULT_DPI = 300
+DEFAULT_DPI = 400
 MIN_DPI = 150
-MAX_DPI = 400
+MAX_DPI = 600
 
 
 @st.cache_data(show_spinner=False)
@@ -27,7 +27,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 def ocr_page(img: Image.Image) -> str:
     fill = 255 if img.mode == "L" else (255, 255, 255)
-    padded = ImageOps.expand(img, border=40, fill=fill)
+    padded = ImageOps.expand(img, border=100, fill=fill)
     try:
         text = pytesseract.image_to_string(padded, lang=TESSERACT_LANG, config=TESSERACT_CONFIG)
         return text.translate(_NUMERAL_TABLE)
