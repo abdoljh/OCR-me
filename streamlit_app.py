@@ -8,10 +8,16 @@ from pdf2image import convert_from_bytes
 _NUMERAL_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 TESSERACT_LANG = "ara"
-TESSERACT_CONFIG = "--oem 1 --psm 3"
+TESSERACT_OEM = "--oem 1"
 DEFAULT_DPI = 400
 MIN_DPI = 150
 MAX_DPI = 600
+DEFAULT_PSM = 6
+PSM_OPTIONS = {
+    6: "6 — Uniform block  (default · captures headers & footers)",
+    4: "4 — Single column, variable sizes",
+    3: "3 — Auto layout detection  (multi-column documents)",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -25,11 +31,12 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 
-def ocr_page(img: Image.Image) -> str:
+def ocr_page(img: Image.Image, psm: int) -> str:
     fill = 255 if img.mode == "L" else (255, 255, 255)
     padded = ImageOps.expand(img, border=100, fill=fill)
+    config = f"{TESSERACT_OEM} --psm {psm}"
     try:
-        text = pytesseract.image_to_string(padded, lang=TESSERACT_LANG, config=TESSERACT_CONFIG)
+        text = pytesseract.image_to_string(padded, lang=TESSERACT_LANG, config=config)
         return text.translate(_NUMERAL_TABLE)
     except pytesseract.TesseractError as exc:
         return f"[OCR error on this page: {exc}]"
@@ -90,21 +97,32 @@ def render_sidebar() -> tuple:
             step=50,
             help="Higher DPI improves OCR accuracy at the cost of speed and memory.",
         )
+        psm = st.selectbox(
+            "Page segmentation mode",
+            options=list(PSM_OPTIONS.keys()),
+            format_func=lambda x: PSM_OPTIONS[x],
+            index=list(PSM_OPTIONS.keys()).index(DEFAULT_PSM),
+            help=(
+                "PSM 6 processes the full image as one text block — best for "
+                "single-column Arabic documents; captures headers and footers reliably. "
+                "Use PSM 3 only for multi-column layouts."
+            ),
+        )
         show_images = st.checkbox("Show page images", value=False)
         preprocess = st.checkbox(
             "Enhance contrast (grayscale)",
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
-    return dpi, show_images, preprocess
+    return dpi, psm, show_images, preprocess
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
-    st.caption("Extract Arabic text from PDF files using Tesseract OCR (OEM 1 LSTM · PSM 3 auto-layout · lang: ara)")
 
-    dpi, show_images, preprocess = render_sidebar()
+    dpi, psm, show_images, preprocess = render_sidebar()
+    st.caption(f"Tesseract OCR · OEM 1 LSTM · PSM {psm} · lang: ara")
 
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)",
@@ -124,7 +142,7 @@ def main() -> None:
 
     for file_idx, file_obj in enumerate(uploaded_files):
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}"
 
         if cache_key not in st.session_state["results"]:
             try:
@@ -140,7 +158,7 @@ def main() -> None:
 
             for i, img in enumerate(images):
                 work_img = preprocess_image(img) if preprocess else img
-                page_texts.append(ocr_page(work_img))
+                page_texts.append(ocr_page(work_img, psm))
                 progress_bar.progress(
                     (i + 1) / total_pages,
                     text=f"OCR: page {i + 1} of {total_pages}",
