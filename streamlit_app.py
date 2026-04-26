@@ -12,12 +12,17 @@ TESSERACT_OEM = "--oem 1"
 DEFAULT_DPI = 400
 MIN_DPI = 150
 MAX_DPI = 600
-DEFAULT_PSM = 6
+DEFAULT_PSM = 4
 PSM_OPTIONS = {
-    6: "6 — Uniform block  (default · captures headers & footers)",
-    4: "4 — Single column, variable sizes",
+    4: "4 — Single column, variable sizes  (default)",
+    6: "6 — Uniform text block",
     3: "3 — Auto layout detection  (multi-column documents)",
 }
+
+# Two-pass OCR constants
+BORDER_PX = 100          # white padding added on all sides before OCR
+HEADER_CONTENT_MM = 20   # page content depth (from top) treated as header zone
+HEADER_CONF_MIN = 50     # minimum Tesseract word confidence to keep from header strip
 
 
 @st.cache_data(show_spinner=False)
@@ -31,12 +36,51 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 
-def ocr_page(img: Image.Image, psm: int) -> str:
+def _header_strip_px(dpi: int) -> int:
+    """Height in pixels of the header zone: our border + top 20 mm of page content."""
+    return BORDER_PX + int(HEADER_CONTENT_MM / 25.4 * dpi)
+
+
+def _ocr_strip_filtered(strip: Image.Image) -> str:
+    """OCR a narrow strip and return only words whose Tesseract confidence >= HEADER_CONF_MIN.
+
+    This filters decoration/noise artefacts (low confidence) while keeping real
+    header text (high confidence), even when both appear in the same strip.
+    """
+    try:
+        data = pytesseract.image_to_data(
+            strip,
+            lang=TESSERACT_LANG,
+            config=f"{TESSERACT_OEM} --psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+    except pytesseract.TesseractError:
+        return ""
+    line_words: dict = {}
+    for word, conf, block, par, line in zip(
+        data["text"], data["conf"],
+        data["block_num"], data["par_num"], data["line_num"],
+    ):
+        if word.strip() and int(conf) >= HEADER_CONF_MIN:
+            line_words.setdefault((block, par, line), []).append(word)
+    return "\n".join(" ".join(words) for words in line_words.values())
+
+
+def ocr_page(img: Image.Image, psm: int, dpi: int) -> str:
     fill = 255 if img.mode == "L" else (255, 255, 255)
-    padded = ImageOps.expand(img, border=100, fill=fill)
+    padded = ImageOps.expand(img, border=BORDER_PX, fill=fill)
+    strip_h = _header_strip_px(dpi)
+
+    # Pass 1: header strip — confidence-filtered to remove decoration noise
+    header_strip = padded.crop((0, 0, padded.width, strip_h))
+    header_text = _ocr_strip_filtered(header_strip).strip()
+
+    # Pass 2: body — cropped below the header strip, processed with chosen PSM
+    body_img = padded.crop((0, strip_h, padded.width, padded.height))
     config = f"{TESSERACT_OEM} --psm {psm}"
     try:
-        text = pytesseract.image_to_string(padded, lang=TESSERACT_LANG, config=config)
+        body_text = pytesseract.image_to_string(body_img, lang=TESSERACT_LANG, config=config)
+        text = (header_text + "\n\n" + body_text) if header_text else body_text
         return text.translate(_NUMERAL_TABLE)
     except pytesseract.TesseractError as exc:
         return f"[OCR error on this page: {exc}]"
@@ -103,9 +147,10 @@ def render_sidebar() -> tuple:
             format_func=lambda x: PSM_OPTIONS[x],
             index=list(PSM_OPTIONS.keys()).index(DEFAULT_PSM),
             help=(
-                "PSM 6 processes the full image as one text block — best for "
-                "single-column Arabic documents; captures headers and footers reliably. "
-                "Use PSM 3 only for multi-column layouts."
+                "Applies to the body region only. The page header is always extracted "
+                "separately via a confidence-filtered strip OCR, regardless of this setting. "
+                "PSM 4 gives the best body accuracy for single-column Arabic documents. "
+                "Use PSM 3 for multi-column layouts."
             ),
         )
         show_images = st.checkbox("Show page images", value=False)
@@ -122,7 +167,7 @@ def main() -> None:
     st.title("Arabic PDF OCR")
 
     dpi, psm, show_images, preprocess = render_sidebar()
-    st.caption(f"Tesseract OCR · OEM 1 LSTM · PSM {psm} · lang: ara")
+    st.caption(f"Tesseract OCR · OEM 1 LSTM · header strip + PSM {psm} body · lang: ara")
 
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)",
@@ -158,7 +203,7 @@ def main() -> None:
 
             for i, img in enumerate(images):
                 work_img = preprocess_image(img) if preprocess else img
-                page_texts.append(ocr_page(work_img, psm))
+                page_texts.append(ocr_page(work_img, psm, dpi))
                 progress_bar.progress(
                     (i + 1) / total_pages,
                     text=f"OCR: page {i + 1} of {total_pages}",
