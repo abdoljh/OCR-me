@@ -1,10 +1,11 @@
 import hashlib
-import io
 
 import streamlit as st
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 import pytesseract
 from pdf2image import convert_from_bytes
+
+_NUMERAL_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 TESSERACT_LANG = "ara"
 TESSERACT_CONFIG = "--oem 1 --psm 3"
@@ -25,8 +26,11 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 
 def ocr_page(img: Image.Image) -> str:
+    fill = 255 if img.mode == "L" else (255, 255, 255)
+    padded = ImageOps.expand(img, border=40, fill=fill)
     try:
-        return pytesseract.image_to_string(img, lang=TESSERACT_LANG, config=TESSERACT_CONFIG)
+        text = pytesseract.image_to_string(padded, lang=TESSERACT_LANG, config=TESSERACT_CONFIG)
+        return text.translate(_NUMERAL_TABLE)
     except pytesseract.TesseractError as exc:
         return f"[OCR error on this page: {exc}]"
 
