@@ -13,8 +13,12 @@ _SENTENCE_ENDERS = frozenset('.؟!…۔')
 
 _BIDI = re.compile(r'[‎‏‪-‮⁦-⁩]')
 
-# Block is noise if it contains only digits, spaces, bidi marks and basic punctuation
+# Block is noise if it contains only digits, spaces, bidi marks and basic Arabic punctuation
 _NOISE_RE = re.compile(r'^[‎‏‪-‮⁦-⁩\d\s،؛؟]+$')
+
+# Any block stripped of bidi/spaces that is ≤20 chars and contains a digit is a
+# page-number or header-fragment (e.g. "16 1 ء 11", "5 مقد مه", "‎1‏ مقدمه")
+_HAS_DIGIT = re.compile(r'[\d٠-٩]')
 
 
 class CleanResult(NamedTuple):
@@ -39,12 +43,38 @@ def _is_page_noise(block: str) -> bool:
     clean = _BIDI.sub('', block).strip()
     if len(clean) <= 5:
         return True
-    return bool(_NOISE_RE.match(clean))
+    if _NOISE_RE.match(clean):
+        return True
+    # Short blocks containing a digit are page numbers / header fragments
+    if len(clean) <= 20 and _HAS_DIGIT.search(clean):
+        return True
+    return False
 
 
 def _ends_sentence(text: str) -> bool:
     stripped = text.rstrip()
     return bool(stripped) and stripped[-1] in _SENTENCE_ENDERS
+
+
+def _process_page(
+    page_text: str,
+    move_footnotes: bool,
+    arabic_indic_numerals: bool,
+) -> tuple[list[str], list[str]]:
+    """Return (body_blocks, footnote_blocks) for one page."""
+    body: list[str] = []
+    notes: list[str] = []
+    for block in _split_blocks(page_text):
+        if _is_page_noise(block):
+            continue
+        joined = _join_lines(block)
+        if arabic_indic_numerals:
+            joined = joined.translate(_WESTERN_TO_INDIC)
+        if move_footnotes and _is_footnote(block):
+            notes.append(joined)
+        else:
+            body.append(joined)
+    return body, notes
 
 
 def clean_pages(
@@ -54,31 +84,26 @@ def clean_pages(
 ) -> CleanResult:
     """Post-process raw OCR page texts into a clean document.
 
-    Joins broken lines, merges cross-page sentence continuations, optionally
-    extracts footnotes to a separate list, and converts Western→Arabic-Indic
-    numerals on request.
+    Joins broken lines within paragraphs, merges cross-page sentence
+    continuations (last block of page N with first block of page N+1 when
+    no sentence terminator), optionally extracts footnotes, and converts
+    Western→Arabic-Indic numerals on request.
     """
-    body_blocks: list[str] = []
-    footnotes: list[str] = []
+    pages_blocks: list[list[str]] = []
+    all_footnotes: list[str] = []
 
     for page_text in pages:
-        for block in _split_blocks(page_text):
-            if _is_page_noise(block):
-                continue
-            joined = _join_lines(block)
-            if arabic_indic_numerals:
-                joined = joined.translate(_WESTERN_TO_INDIC)
-            if move_footnotes and _is_footnote(block):
-                footnotes.append(joined)
-            else:
-                body_blocks.append(joined)
+        body, notes = _process_page(page_text, move_footnotes, arabic_indic_numerals)
+        pages_blocks.append(body)
+        all_footnotes.extend(notes)
 
-    # Merge cross-page sentence continuations
-    merged: list[str] = []
-    for block in body_blocks:
-        if merged and not _ends_sentence(merged[-1]):
-            merged[-1] = merged[-1] + ' ' + block
-        else:
-            merged.append(block)
+    # Cross-page sentence continuation: merge last block of page N with
+    # first block of page N+1 only when the last block has no sentence terminator
+    for i in range(len(pages_blocks) - 1):
+        if pages_blocks[i] and pages_blocks[i + 1]:
+            if not _ends_sentence(pages_blocks[i][-1]):
+                pages_blocks[i][-1] += ' ' + pages_blocks[i + 1][0]
+                pages_blocks[i + 1] = pages_blocks[i + 1][1:]
 
-    return CleanResult(body='\n\n'.join(merged), footnotes=footnotes)
+    all_blocks = [block for page in pages_blocks for block in page]
+    return CleanResult(body='\n\n'.join(all_blocks), footnotes=all_footnotes)
