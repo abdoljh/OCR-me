@@ -7,6 +7,8 @@ from PIL import Image, ImageEnhance, ImageOps
 import pytesseract
 from pdf2image import convert_from_bytes
 
+from post_process import clean_pages
+
 _NUMERAL_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 TESSERACT_OEM = "--oem 1"
@@ -219,14 +221,25 @@ def render_sidebar() -> tuple:
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
-    return model_key, dpi, psm, show_images, preprocess
+        st.subheader("Post-processing")
+        move_footnotes = st.checkbox(
+            "Extract footnotes to end",
+            value=True,
+            help="Detects footnote blocks (e.g. )1( or (7)) and moves them to the end of the cleaned document.",
+        )
+        arabic_indic = st.checkbox(
+            "Convert to Arabic-Indic numerals",
+            value=False,
+            help="Converts Western digits (0–9) → Arabic-Indic (٠–٩) in the cleaned output.",
+        )
+    return model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    model_key, dpi, psm, show_images, preprocess = render_sidebar()
+    model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic = render_sidebar()
 
     # Resolve language model (downloads if needed)
     info = LANG_MODELS[model_key]
@@ -262,6 +275,7 @@ def main() -> None:
         st.session_state["results"] = {}
 
     all_text_parts: list[str] = []
+    all_raw_pages: list[str] = []
 
     for file_idx, file_obj in enumerate(uploaded_files):
         pdf_bytes = file_obj.read()
@@ -311,16 +325,46 @@ def main() -> None:
                 img=img,
             )
             all_text_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
+            all_raw_pages.append(text)
 
         st.divider()
 
-    if all_text_parts:
-        combined = "\n\n".join(all_text_parts)
+    if not all_text_parts:
+        return
+
+    tab_raw, tab_clean = st.tabs(["Raw OCR output", "Cleaned text"])
+
+    with tab_raw:
+        combined_raw = "\n\n".join(all_text_parts)
         st.download_button(
-            label="Download all extracted text (.txt)",
-            data=combined.encode("utf-8"),
-            file_name="ocr_output.txt",
+            label="Download raw text (.txt)",
+            data=combined_raw.encode("utf-8"),
+            file_name="ocr_output_raw.txt",
             mime="text/plain; charset=utf-8",
+            key="dl_raw",
+        )
+
+    with tab_clean:
+        result = clean_pages(
+            all_raw_pages,
+            move_footnotes=move_footnotes,
+            arabic_indic_numerals=arabic_indic,
+        )
+        render_rtl_text(result.body)
+        if result.footnotes:
+            st.markdown("---")
+            st.markdown("**Footnotes**")
+            render_rtl_text("\n\n".join(result.footnotes))
+
+        clean_parts = [result.body]
+        if result.footnotes:
+            clean_parts.append("=== Footnotes ===\n" + "\n\n".join(result.footnotes))
+        st.download_button(
+            label="Download cleaned text (.txt)",
+            data="\n\n".join(clean_parts).encode("utf-8"),
+            file_name="ocr_output_clean.txt",
+            mime="text/plain; charset=utf-8",
+            key="dl_clean",
         )
 
 
