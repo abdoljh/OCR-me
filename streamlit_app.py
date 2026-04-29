@@ -109,7 +109,17 @@ def _ensure_model(model_key: str) -> tuple[str, str, bool]:
     return info["lang"], TESSDATA_CACHE_DIR, False
 
 
+def _remove_alpha(img: Image.Image) -> Image.Image:
+    """Composite alpha channel against white, matching Tesseract 4's pixRemoveAlpha()."""
+    if img.mode not in ('RGBA', 'LA', 'PA'):
+        return img
+    rgba = img.convert('RGBA')
+    background = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(background, rgba).convert('RGB')
+
+
 def preprocess_image(img: Image.Image) -> Image.Image:
+    img = _remove_alpha(img)
     img = img.convert("L")
     img = ImageEnhance.Contrast(img).enhance(2.0)
     # Unsharp mask sharpens dot features (radius=1 keeps it sub-pixel at 300+ DPI,
@@ -194,6 +204,7 @@ def ocr_page(
     tessdata_dir: str,
     disable_dict: bool = False,
 ) -> str:
+    img = _remove_alpha(img)
     img = _auto_rotate(img)
     fill = 255 if img.mode == "L" else (255, 255, 255)
     padded = ImageOps.expand(img, border=BORDER_PX, fill=fill)
