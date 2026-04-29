@@ -1,5 +1,7 @@
 import hashlib
 import os
+import subprocess
+import tempfile
 import urllib.request
 
 import streamlit as st
@@ -15,6 +17,7 @@ TESSERACT_OEM = "--oem 1"
 DEFAULT_DPI = 400
 MIN_DPI = 150
 MAX_DPI = 600
+DISPLAY_DPI = 150  # DPI used only for UI image previews — OCR uses the user-selected DPI
 DEFAULT_PSM = 4
 PSM_OPTIONS = {
     4: "4 — Single column, variable sizes  (default)",
@@ -53,8 +56,38 @@ DEFAULT_MODEL = "best"
 
 
 @st.cache_data(show_spinner=False)
-def pdf_to_images(pdf_bytes: bytes, dpi: int) -> list:
-    return convert_from_bytes(pdf_bytes, dpi=dpi)
+def _get_page_count(pdf_bytes: bytes) -> int:
+    """Return PDF page count using pdfinfo (fast). Falls back to 36-DPI render."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes)
+        tmp = f.name
+    try:
+        out = subprocess.check_output(
+            ["pdfinfo", tmp], stderr=subprocess.DEVNULL, timeout=10, text=True
+        )
+        for line in out.splitlines():
+            if line.startswith("Pages:"):
+                return int(line.split(":")[1].strip())
+    except Exception:
+        pass
+    finally:
+        os.unlink(tmp)
+    return len(convert_from_bytes(pdf_bytes, dpi=36))
+
+
+@st.cache_data(show_spinner=False)
+def _render_display_page(pdf_bytes: bytes, page_num: int) -> Image.Image:
+    """Render a single page at DISPLAY_DPI for UI preview. Cached."""
+    return convert_from_bytes(
+        pdf_bytes, dpi=DISPLAY_DPI, first_page=page_num, last_page=page_num
+    )[0]
+
+
+def _render_ocr_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
+    """Render a single page at OCR DPI. Not cached — caller discards after use."""
+    return convert_from_bytes(
+        pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num
+    )[0]
 
 
 @st.cache_resource(show_spinner=False)
@@ -152,6 +185,7 @@ def render_rtl_text(text: str) -> None:
         f"font-family:Arial,sans-serif;"
         f"font-size:16px;"
         f"line-height:2;"
+        f"color:#1a1a1a;"
         f"background-color:#f8f8f8;"
         f"padding:12px 16px;"
         f"border-radius:6px;"
@@ -169,10 +203,11 @@ def render_page_result(
     total: int,
     text: str,
     show_image: bool,
-    img: Image.Image,
+    pdf_bytes: bytes,
 ) -> None:
     st.subheader(f"Page {page_num} of {total}")
     if show_image:
+        img = _render_display_page(pdf_bytes, page_num)
         st.image(img, use_container_width=True, caption=f"Page {page_num}")
     render_rtl_text(text)
     st.text_area(
@@ -285,33 +320,39 @@ def main() -> None:
         cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}"
 
         if cache_key not in st.session_state["results"]:
-            try:
-                with st.spinner(f"Rendering pages for {file_obj.name}…"):
-                    images = pdf_to_images(pdf_bytes, dpi)
-            except Exception as exc:
-                st.error(f"Failed to render '{file_obj.name}': {exc}")
+            total_pages = _get_page_count(pdf_bytes)
+            if total_pages == 0:
+                st.error(f"Could not read '{file_obj.name}' — is it a valid PDF?")
                 continue
 
-            total_pages = len(images)
             page_texts: list[str] = []
             progress_bar = st.progress(0, text=f"OCR: page 1 of {total_pages}")
 
-            for i, img in enumerate(images):
+            for page_num in range(1, total_pages + 1):
+                try:
+                    img = _render_ocr_page(pdf_bytes, page_num, dpi)
+                except Exception as exc:
+                    page_texts.append(f"[Failed to render page {page_num}: {exc}]")
+                    continue
                 work_img = preprocess_image(img) if preprocess else img
                 page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir))
+                del img, work_img  # free the large raster before next page
                 progress_bar.progress(
-                    (i + 1) / total_pages,
-                    text=f"OCR: page {i + 1} of {total_pages}",
+                    page_num / total_pages,
+                    text=f"OCR: page {page_num} of {total_pages}",
                 )
 
             progress_bar.empty()
             st.session_state["results"][cache_key] = {
                 "pages": page_texts,
-                "images": images,
                 "filename": file_obj.name,
             }
 
-        file_results.append(st.session_state["results"][cache_key])
+        # pdf_bytes held only for this rerun (not stored in session state)
+        file_results.append({
+            **st.session_state["results"][cache_key],
+            "pdf_bytes": pdf_bytes,
+        })
 
     if not file_results:
         return
@@ -323,17 +364,17 @@ def main() -> None:
         for file_idx, fr in enumerate(file_results):
             filename = fr["filename"]
             page_texts = fr["pages"]
-            images = fr["images"]
+            pdf_bytes = fr["pdf_bytes"]
             total = len(page_texts)
             st.header(filename)
-            for page_num, (text, img) in enumerate(zip(page_texts, images), start=1):
+            for page_num, text in enumerate(page_texts, start=1):
                 render_page_result(
                     file_idx=file_idx,
                     page_num=page_num,
                     total=total,
                     text=text,
                     show_image=show_images,
-                    img=img,
+                    pdf_bytes=pdf_bytes,
                 )
                 raw_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
             st.divider()
