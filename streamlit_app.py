@@ -5,7 +5,7 @@ import tempfile
 import urllib.request
 
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 from pdf2image import convert_from_bytes
 
@@ -118,12 +118,48 @@ def _remove_alpha(img: Image.Image) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert('RGB')
 
 
-def preprocess_image(img: Image.Image) -> Image.Image:
+def _textcleaner_core(img: Image.Image, dpi: int) -> Image.Image:
+    """
+    Background cleaning via local-area thresholding — replicates textcleaner defaults.
+
+    Pipeline (matches textcleaner's core ImageMagick command):
+      1. autocontrast  (= -contrast-stretch 0 / -e stretch)
+      2. estimate local background with a box blur
+      3. pixels significantly darker than local background → text (kept)
+         everything else → pure white
+
+    filter_size scales with DPI so it always exceeds Arabic stroke width
+    (~3–6 px per 300 DPI) while staying well below inter-line spacing.
+    offset_pct=5 is textcleaner's default noise-elimination threshold.
+    """
+    assert img.mode == 'L'
+
+    # 1. Contrast-stretch: map darkest→0, brightest→255
+    stretched = ImageOps.autocontrast(img, cutoff=0)
+
+    # 2. Local background estimate via box blur
+    #    filter_size must be > stroke width; 30 px at 300 DPI scales linearly
+    filter_size = max(15, int(30 * dpi / 300))
+    background_est = stretched.filter(ImageFilter.BoxBlur(filter_size // 2))
+
+    # 3. Difference: large where pixel is darker than local background (= text)
+    diff = ImageChops.subtract(background_est, stretched)   # clip(bg - px, 0, 255)
+
+    # 4. Threshold the diff with a LUT (much faster than a Python lambda)
+    offset_val = int(5 * 255 / 100)   # 5% of range = textcleaner -o 5 default
+    lut = [255 if x > offset_val else 0 for x in range(256)]
+    text_mask = diff.point(lut)
+
+    # 5. Composite: text pixels from stretched image, pure white everywhere else
+    white = Image.new('L', img.size, 255)
+    return Image.composite(stretched, white, text_mask)
+
+
+def preprocess_image(img: Image.Image, dpi: int = 300) -> Image.Image:
     img = _remove_alpha(img)
     img = img.convert("L")
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    # Unsharp mask sharpens dot features (radius=1 keeps it sub-pixel at 300+ DPI,
-    # percent=150 gives a moderate boost without introducing halos on thin strokes).
+    img = _textcleaner_core(img, dpi)
+    # Unsharp mask sharpens dot features after background has been cleaned.
     img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
     return img
 
@@ -424,7 +460,7 @@ def main() -> None:
                 except Exception as exc:
                     page_texts.append(f"[Failed to render page {page_num}: {exc}]")
                     continue
-                work_img = preprocess_image(img) if preprocess else img
+                work_img = preprocess_image(img, dpi) if preprocess else img
                 page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir, disable_dict))
                 del img, work_img  # free the large raster before next page
                 progress_bar.progress(
