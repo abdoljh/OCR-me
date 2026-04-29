@@ -58,20 +58,21 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int) -> list:
 
 
 @st.cache_resource(show_spinner=False)
-def _ensure_model(model_key: str) -> tuple[str, str]:
-    """Download model traineddata if needed. Returns (tesseract_lang, tessdata_dir)."""
+def _ensure_model(model_key: str) -> tuple[str, str, bool]:
+    """Download model traineddata if needed. Returns (lang, tessdata_dir, used_fallback)."""
     info = LANG_MODELS[model_key]
     if info["url"] is None:
-        return info["lang"], ""
+        return info["lang"], "", False
     os.makedirs(TESSDATA_CACHE_DIR, exist_ok=True)
     dest = os.path.join(TESSDATA_CACHE_DIR, info["filename"])
     if not os.path.exists(dest):
         try:
-            urllib.request.urlretrieve(info["url"], dest)
+            with urllib.request.urlopen(info["url"], timeout=30) as resp:
+                with open(dest, "wb") as fh:
+                    fh.write(resp.read())
         except Exception:
-            st.warning(f"Could not download {info['label']} — falling back to standard model.")
-            return LANG_MODELS["standard"]["lang"], ""
-    return info["lang"], TESSDATA_CACHE_DIR
+            return LANG_MODELS["standard"]["lang"], "", True
+    return info["lang"], TESSDATA_CACHE_DIR, False
 
 
 def preprocess_image(img: Image.Image) -> Image.Image:
@@ -88,7 +89,7 @@ def _header_strip_px(dpi: int) -> int:
 def _build_config(psm: int, tessdata_dir: str) -> str:
     parts = [TESSERACT_OEM, f"--psm {psm}"]
     if tessdata_dir:
-        parts.append(f"--tessdata-dir {tessdata_dir}")
+        parts.append(f'--tessdata-dir "{tessdata_dir}"')
     return " ".join(parts)
 
 
@@ -182,7 +183,7 @@ def render_page_result(
     )
 
 
-def render_sidebar() -> tuple:
+def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool]:
     with st.sidebar:
         st.header("Settings")
         model_key = st.selectbox(
@@ -251,9 +252,12 @@ def main() -> None:
     if needs_download:
         size_hint = info["label"].split("·")[1].strip()
         with st.spinner(f"Downloading language model ({size_hint})…"):
-            lang, tessdata_dir = _ensure_model(model_key)
+            lang, tessdata_dir, used_fallback = _ensure_model(model_key)
     else:
-        lang, tessdata_dir = _ensure_model(model_key)
+        lang, tessdata_dir, used_fallback = _ensure_model(model_key)
+
+    if used_fallback:
+        st.warning(f"Could not download {info['label']} — using standard model.")
 
     st.caption(
         f"Tesseract OCR · OEM 1 LSTM · PSM {psm} · "
@@ -274,10 +278,9 @@ def main() -> None:
     if "results" not in st.session_state:
         st.session_state["results"] = {}
 
-    all_text_parts: list[str] = []
-    all_raw_pages: list[str] = []
-
-    for file_idx, file_obj in enumerate(uploaded_files):
+    # Collect OCR results for all files first (spinners/progress bars render here)
+    file_results: list[dict] = []
+    for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
         cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}"
 
@@ -308,60 +311,68 @@ def main() -> None:
                 "filename": file_obj.name,
             }
 
-        result = st.session_state["results"][cache_key]
-        page_texts = result["pages"]
-        images = result["images"]
-        filename = result["filename"]
-        total = len(page_texts)
+        file_results.append(st.session_state["results"][cache_key])
 
-        st.header(filename)
-        for page_num, (text, img) in enumerate(zip(page_texts, images), start=1):
-            render_page_result(
-                file_idx=file_idx,
-                page_num=page_num,
-                total=total,
-                text=text,
-                show_image=show_images,
-                img=img,
-            )
-            all_text_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
-            all_raw_pages.append(text)
-
-        st.divider()
-
-    if not all_text_parts:
+    if not file_results:
         return
 
     tab_raw, tab_clean = st.tabs(["Raw OCR output", "Cleaned text"])
 
     with tab_raw:
-        combined_raw = "\n\n".join(all_text_parts)
+        raw_parts: list[str] = []
+        for file_idx, fr in enumerate(file_results):
+            filename = fr["filename"]
+            page_texts = fr["pages"]
+            images = fr["images"]
+            total = len(page_texts)
+            st.header(filename)
+            for page_num, (text, img) in enumerate(zip(page_texts, images), start=1):
+                render_page_result(
+                    file_idx=file_idx,
+                    page_num=page_num,
+                    total=total,
+                    text=text,
+                    show_image=show_images,
+                    img=img,
+                )
+                raw_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
+            st.divider()
         st.download_button(
             label="Download raw text (.txt)",
-            data=combined_raw.encode("utf-8"),
+            data="\n\n".join(raw_parts).encode("utf-8"),
             file_name="ocr_output_raw.txt",
             mime="text/plain; charset=utf-8",
             key="dl_raw",
         )
 
     with tab_clean:
-        result = clean_pages(
-            all_raw_pages,
-            move_footnotes=move_footnotes,
-            arabic_indic_numerals=arabic_indic,
-        )
-        render_rtl_text(result.body)
-        if result.footnotes:
+        all_clean_bodies: list[str] = []
+        all_footnotes: list[str] = []
+        for fr in file_results:
+            # Each file's pages are cleaned independently — no cross-file merging
+            clean_result = clean_pages(
+                fr["pages"],
+                move_footnotes=move_footnotes,
+                arabic_indic_numerals=arabic_indic,
+            )
+            if clean_result.body:
+                if len(file_results) > 1:
+                    st.subheader(fr["filename"])
+                render_rtl_text(clean_result.body)
+                all_clean_bodies.append(clean_result.body)
+            all_footnotes.extend(clean_result.footnotes)
+
+        if all_footnotes:
             st.markdown("---")
             st.markdown("**Footnotes**")
-            render_rtl_text("\n\n".join(result.footnotes))
+            render_rtl_text("\n\n".join(all_footnotes))
 
-        clean_parts = [result.body]
-        if result.footnotes:
-            clean_parts.append("=== Footnotes ===\n" + "\n\n".join(result.footnotes))
+        download_parts = list(all_clean_bodies)
+        if all_footnotes:
+            download_parts.append("=== Footnotes ===\n" + "\n\n".join(all_footnotes))
         st.download_button(
             label="Download cleaned text (.txt)",
-            data="\n\n".join(clean_parts).encode("utf-8"),
+            data="\n\n".join(download_parts).encode("utf-8"),
             file_name="ocr_output_clean.txt",
             mime="text/plain; charset=utf-8",
             key="dl_clean",

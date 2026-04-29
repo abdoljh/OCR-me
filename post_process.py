@@ -16,9 +16,9 @@ _BIDI = re.compile(r'[‎‏‪-‮⁦-⁩]')
 # Block is noise if it contains only digits, spaces, bidi marks and basic Arabic punctuation
 _NOISE_RE = re.compile(r'^[‎‏‪-‮⁦-⁩\d\s،؛؟]+$')
 
-# Any block stripped of bidi/spaces that is ≤20 chars and contains a digit is a
-# page-number or header-fragment (e.g. "16 1 ء 11", "5 مقد مه", "‎1‏ مقدمه")
 _HAS_DIGIT = re.compile(r'[\d٠-٩]')
+# Blocks ≤ this many chars that contain a digit are page-number / header fragments
+_PAGE_NOISE_MAX_CHARS = 20
 
 
 class CleanResult(NamedTuple):
@@ -31,7 +31,7 @@ def _split_blocks(text: str) -> list[str]:
 
 
 def _join_lines(block: str) -> str:
-    return re.sub(r'(?<!\n)\n(?!\n)', ' ', block).strip()
+    return block.replace('\n', ' ').strip()
 
 
 def _is_footnote(block: str) -> bool:
@@ -45,8 +45,7 @@ def _is_page_noise(block: str) -> bool:
         return True
     if _NOISE_RE.match(clean):
         return True
-    # Short blocks containing a digit are page numbers / header fragments
-    if len(clean) <= 20 and _HAS_DIGIT.search(clean):
+    if len(clean) <= _PAGE_NOISE_MAX_CHARS and _HAS_DIGIT.search(clean):
         return True
     return False
 
