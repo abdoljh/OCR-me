@@ -5,7 +5,7 @@ import tempfile
 import urllib.request
 
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 from pdf2image import convert_from_bytes
 
@@ -112,6 +112,9 @@ def _ensure_model(model_key: str) -> tuple[str, str, bool]:
 def preprocess_image(img: Image.Image) -> Image.Image:
     img = img.convert("L")
     img = ImageEnhance.Contrast(img).enhance(2.0)
+    # Unsharp mask sharpens dot features (radius=1 keeps it sub-pixel at 300+ DPI,
+    # percent=150 gives a moderate boost without introducing halos on thin strokes).
+    img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
     return img
 
 
