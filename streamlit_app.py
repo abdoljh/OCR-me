@@ -155,10 +155,17 @@ def _textcleaner_core(img: Image.Image, dpi: int) -> Image.Image:
     return Image.composite(stretched, white, text_mask)
 
 
-def preprocess_image(img: Image.Image, dpi: int = 300) -> Image.Image:
+def preprocess_image(
+    img: Image.Image,
+    dpi: int = 300,
+    use_textcleaner: bool = True,
+) -> Image.Image:
     img = _remove_alpha(img)
     img = img.convert("L")
-    img = _textcleaner_core(img, dpi)
+    if use_textcleaner:
+        img = _textcleaner_core(img, dpi)
+    else:
+        img = ImageEnhance.Contrast(img).enhance(2.0)
     # Unsharp mask sharpens dot features after background has been cleaned.
     img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
     return img
@@ -305,11 +312,19 @@ def render_page_result(
     text: str,
     show_image: bool,
     pdf_bytes: bytes,
+    preprocess: bool = False,
+    use_textcleaner: bool = False,
 ) -> None:
     st.subheader(f"Page {page_num} of {total}")
     if show_image:
-        img = _render_display_page(pdf_bytes, page_num)
-        st.image(img, use_container_width=True, caption=f"Page {page_num}")
+        orig = _render_display_page(pdf_bytes, page_num)
+        if preprocess:
+            cleaned = preprocess_image(orig, DISPLAY_DPI, use_textcleaner)
+            col_orig, col_clean = st.columns(2)
+            col_orig.image(orig, use_container_width=True, caption="Original")
+            col_clean.image(cleaned, use_container_width=True, caption="After preprocessing")
+        else:
+            st.image(orig, use_container_width=True, caption=f"Page {page_num}")
     render_rtl_text(text)
     st.text_area(
         label=f"Copy text — Page {page_num}",
@@ -358,6 +373,19 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
+        use_textcleaner = st.checkbox(
+            "Clean background (textcleaner LAT)",
+            value=True,
+            disabled=not preprocess,
+            help=(
+                "Removes uneven background, paper yellowing, and scan noise using "
+                "local-area thresholding — a Python re-implementation of Fred Weinhaus's "
+                "textcleaner script. Each pixel is compared against its local neighbourhood "
+                "mean; background regions are replaced with pure white while text is kept. "
+                "Requires 'Enhance contrast' to be enabled. "
+                "Enable 'Show page images' to preview the before/after effect."
+            ),
+        )
         disable_dict = st.checkbox(
             "Disable Tesseract dictionary",
             value=False,
@@ -389,7 +417,7 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
             ),
         )
     return (
-        model_key, dpi, psm, show_images, preprocess,
+        model_key, dpi, psm, show_images, preprocess, use_textcleaner,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     )
 
@@ -399,7 +427,7 @@ def main() -> None:
     st.title("Arabic PDF OCR")
 
     (
-        model_key, dpi, psm, show_images, preprocess,
+        model_key, dpi, psm, show_images, preprocess, use_textcleaner,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     ) = render_sidebar()
 
@@ -443,7 +471,7 @@ def main() -> None:
     file_results: list[dict] = []
     for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}_{disable_dict}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{use_textcleaner}_{psm}_{model_key}_{disable_dict}"
 
         if cache_key not in st.session_state["results"]:
             total_pages = _get_page_count(pdf_bytes)
@@ -460,7 +488,7 @@ def main() -> None:
                 except Exception as exc:
                     page_texts.append(f"[Failed to render page {page_num}: {exc}]")
                     continue
-                work_img = preprocess_image(img, dpi) if preprocess else img
+                work_img = preprocess_image(img, dpi, use_textcleaner) if preprocess else img
                 page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir, disable_dict))
                 del img, work_img  # free the large raster before next page
                 progress_bar.progress(
@@ -501,6 +529,8 @@ def main() -> None:
                     text=text,
                     show_image=show_images,
                     pdf_bytes=pdf_bytes,
+                    preprocess=preprocess,
+                    use_textcleaner=use_textcleaner,
                 )
                 raw_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
             st.divider()
