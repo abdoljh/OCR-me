@@ -29,6 +29,7 @@ PSM_OPTIONS = {
 BORDER_PX = 100        # white padding added on all sides before OCR
 HEADER_CONTENT_MM = 20 # page content depth treated as header zone
 HEADER_CONF_MIN = 65   # minimum Tesseract word confidence to keep from header strip
+_OSD_CONF_MIN = 2.0    # minimum orientation confidence to trust auto-rotation
 
 # Language model options — downloaded once and cached on disk
 TESSDATA_CACHE_DIR = os.path.expanduser("~/.tessdata_custom")
@@ -156,6 +157,24 @@ def _ocr_strip_filtered(
     return "\n".join(" ".join(words) for words in line_words.values())
 
 
+def _auto_rotate(img: Image.Image) -> Image.Image:
+    """Rotate image to upright orientation using Tesseract OSD. Silent no-op on failure."""
+    try:
+        osd = pytesseract.image_to_osd(img, config="--psm 0 --oem 0")
+        rotate = 0
+        conf = 0.0
+        for line in osd.splitlines():
+            if line.startswith("Rotate:"):
+                rotate = int(line.split(":")[1].strip())
+            elif "Orientation confidence:" in line:
+                conf = float(line.split(":")[1].strip())
+        if rotate != 0 and conf >= _OSD_CONF_MIN:
+            return img.rotate(rotate, expand=True)
+    except Exception:
+        pass
+    return img
+
+
 def _arabic_ratio(text: str) -> float:
     """Fraction of non-space characters that fall in the Arabic Unicode block."""
     chars = [c for c in text if not c.isspace()]
@@ -172,6 +191,7 @@ def ocr_page(
     tessdata_dir: str,
     disable_dict: bool = False,
 ) -> str:
+    img = _auto_rotate(img)
     fill = 255 if img.mode == "L" else (255, 255, 255)
     padded = ImageOps.expand(img, border=BORDER_PX, fill=fill)
     strip_h = _header_strip_px(dpi)
