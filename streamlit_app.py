@@ -119,20 +119,24 @@ def _header_strip_px(dpi: int) -> int:
     return BORDER_PX + int(HEADER_CONTENT_MM / 25.4 * dpi)
 
 
-def _build_config(psm: int, tessdata_dir: str) -> str:
+def _build_config(psm: int, tessdata_dir: str, disable_dict: bool = False) -> str:
     parts = [TESSERACT_OEM, f"--psm {psm}"]
     if tessdata_dir:
         parts.append(f'--tessdata-dir "{tessdata_dir}"')
+    if disable_dict:
+        parts += ["-c load_system_dawg=0", "-c load_freq_dawg=0"]
     return " ".join(parts)
 
 
-def _ocr_strip_filtered(strip: Image.Image, lang: str, tessdata_dir: str) -> str:
+def _ocr_strip_filtered(
+    strip: Image.Image, lang: str, tessdata_dir: str, disable_dict: bool = False
+) -> str:
     """OCR a narrow strip, returning only words with Tesseract confidence >= HEADER_CONF_MIN.
 
     Filters decoration/noise artefacts (low confidence) while keeping real
     header text (high confidence), even when both appear in the same strip.
     """
-    config = _build_config(psm=6, tessdata_dir=tessdata_dir)
+    config = _build_config(psm=6, tessdata_dir=tessdata_dir, disable_dict=disable_dict)
     try:
         data = pytesseract.image_to_data(
             strip,
@@ -152,20 +156,47 @@ def _ocr_strip_filtered(strip: Image.Image, lang: str, tessdata_dir: str) -> str
     return "\n".join(" ".join(words) for words in line_words.values())
 
 
-def ocr_page(img: Image.Image, psm: int, dpi: int, lang: str, tessdata_dir: str) -> str:
+def _arabic_ratio(text: str) -> float:
+    """Fraction of non-space characters that fall in the Arabic Unicode block."""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    return sum(1 for c in chars if "؀" <= c <= "ۿ") / len(chars)
+
+
+def ocr_page(
+    img: Image.Image,
+    psm: int,
+    dpi: int,
+    lang: str,
+    tessdata_dir: str,
+    disable_dict: bool = False,
+) -> str:
     fill = 255 if img.mode == "L" else (255, 255, 255)
     padded = ImageOps.expand(img, border=BORDER_PX, fill=fill)
     strip_h = _header_strip_px(dpi)
 
     # Pass 1: header strip — confidence-filtered to remove decoration noise
     header_strip = padded.crop((0, 0, padded.width, strip_h))
-    header_text = _ocr_strip_filtered(header_strip, lang, tessdata_dir).strip()
+    header_text = _ocr_strip_filtered(
+        header_strip, lang, tessdata_dir, disable_dict
+    ).strip()
 
     # Pass 2: body — cropped below the header strip, processed with chosen PSM
     body_img = padded.crop((0, strip_h, padded.width, padded.height))
-    config = _build_config(psm=psm, tessdata_dir=tessdata_dir)
+    config = _build_config(psm=psm, tessdata_dir=tessdata_dir, disable_dict=disable_dict)
     try:
         body_text = pytesseract.image_to_string(body_img, lang=lang, config=config)
+        # Auto-retry with PSM 11 (sparse text) when the result is mostly non-Arabic.
+        # TOC/front-matter pages that block-PSMs mangle often respond better to PSM 11.
+        if psm not in (11, 12) and _arabic_ratio(body_text) < 0.35:
+            sparse_cfg = _build_config(psm=11, tessdata_dir=tessdata_dir, disable_dict=disable_dict)
+            try:
+                sparse_text = pytesseract.image_to_string(body_img, lang=lang, config=sparse_cfg)
+                if _arabic_ratio(sparse_text) > _arabic_ratio(body_text):
+                    body_text = sparse_text
+            except pytesseract.TesseractError:
+                pass
         text = (header_text + "\n\n" + body_text) if header_text else body_text
         return text.translate(_NUMERAL_TABLE)
     except pytesseract.TesseractError as exc:
@@ -218,7 +249,7 @@ def render_page_result(
     )
 
 
-def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool]:
+def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
     with st.sidebar:
         st.header("Settings")
         model_key = st.selectbox(
@@ -257,6 +288,16 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool]:
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
+        disable_dict = st.checkbox(
+            "Disable Tesseract dictionary",
+            value=False,
+            help=(
+                "Turns off the built-in word-frequency correction "
+                "(load_system_dawg=0, load_freq_dawg=0). "
+                "Helps when the dictionary incorrectly 'corrects' rare words, "
+                "names, or specialised vocabulary."
+            ),
+        )
         st.subheader("Post-processing")
         move_footnotes = st.checkbox(
             "Extract footnotes to end",
@@ -268,14 +309,14 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool]:
             value=False,
             help="Converts Western digits (0–9) → Arabic-Indic (٠–٩) in the cleaned output.",
         )
-    return model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic
+    return model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic, disable_dict
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic = render_sidebar()
+    model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic, disable_dict = render_sidebar()
 
     # Resolve language model (downloads if needed)
     info = LANG_MODELS[model_key]
@@ -317,7 +358,7 @@ def main() -> None:
     file_results: list[dict] = []
     for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{psm}_{model_key}_{disable_dict}"
 
         if cache_key not in st.session_state["results"]:
             total_pages = _get_page_count(pdf_bytes)
@@ -335,7 +376,7 @@ def main() -> None:
                     page_texts.append(f"[Failed to render page {page_num}: {exc}]")
                     continue
                 work_img = preprocess_image(img) if preprocess else img
-                page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir))
+                page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir, disable_dict))
                 del img, work_img  # free the large raster before next page
                 progress_bar.progress(
                     page_num / total_pages,
