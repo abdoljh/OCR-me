@@ -118,7 +118,7 @@ def _remove_alpha(img: Image.Image) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert('RGB')
 
 
-def _textcleaner_core(img: Image.Image, dpi: int) -> Image.Image:
+def _textcleaner_core(img: Image.Image, dpi: int, offset_pct: int = 5) -> Image.Image:
     """
     Background cleaning via local-area thresholding — replicates textcleaner defaults.
 
@@ -130,7 +130,8 @@ def _textcleaner_core(img: Image.Image, dpi: int) -> Image.Image:
 
     filter_size scales with DPI so it always exceeds Arabic stroke width
     (~3–6 px per 300 DPI) while staying well below inter-line spacing.
-    offset_pct=5 is textcleaner's default noise-elimination threshold.
+    offset_pct: noise-elimination threshold (textcleaner -o); lower values
+    clean more aggressively, higher values preserve more background detail.
     """
     assert img.mode == 'L'
 
@@ -146,7 +147,7 @@ def _textcleaner_core(img: Image.Image, dpi: int) -> Image.Image:
     diff = ImageChops.subtract(background_est, stretched)   # clip(bg - px, 0, 255)
 
     # 4. Threshold the diff with a LUT (much faster than a Python lambda)
-    offset_val = int(5 * 255 / 100)   # 5% of range = textcleaner -o 5 default
+    offset_val = int(offset_pct * 255 / 100)
     lut = [255 if x > offset_val else 0 for x in range(256)]
     text_mask = diff.point(lut)
 
@@ -159,11 +160,12 @@ def preprocess_image(
     img: Image.Image,
     dpi: int = 300,
     use_textcleaner: bool = True,
+    offset_pct: int = 5,
 ) -> Image.Image:
     img = _remove_alpha(img)
     img = img.convert("L")
     if use_textcleaner:
-        img = _textcleaner_core(img, dpi)
+        img = _textcleaner_core(img, dpi, offset_pct)
     else:
         img = ImageEnhance.Contrast(img).enhance(2.0)
     # Unsharp mask sharpens dot features after background has been cleaned.
@@ -314,12 +316,15 @@ def render_page_result(
     pdf_bytes: bytes,
     preprocess: bool = False,
     use_textcleaner: bool = False,
+    offset_pct: int = 5,
 ) -> None:
     st.subheader(f"Page {page_num} of {total}")
     if show_image:
         orig = _render_display_page(pdf_bytes, page_num)
+        # Add a white border so BoxBlur has a clean margin → no edge black spots
+        bordered = ImageOps.expand(orig, border=15, fill=(255, 255, 255))
         if preprocess:
-            cleaned = preprocess_image(orig, DISPLAY_DPI, use_textcleaner)
+            cleaned = preprocess_image(bordered, DISPLAY_DPI, use_textcleaner, offset_pct)
             col_orig, col_clean = st.columns(2)
             col_orig.image(orig, use_container_width=True, caption="Original")
             col_clean.image(cleaned, use_container_width=True, caption="After preprocessing")
@@ -334,7 +339,7 @@ def render_page_result(
     )
 
 
-def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
+def render_sidebar() -> tuple[str, int, int, bool, bool, bool, int, bool, bool, bool, bool]:
     with st.sidebar:
         st.header("Settings")
         model_key = st.selectbox(
@@ -386,6 +391,20 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
                 "Enable 'Show page images' to preview the before/after effect."
             ),
         )
+        offset_pct = st.slider(
+            "Cleaning aggressiveness (offset %)",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+            disabled=not (preprocess and use_textcleaner),
+            help=(
+                "Controls the textcleaner noise-elimination threshold (textcleaner -o). "
+                "Lower values clean more aggressively (remove more background); "
+                "higher values are more conservative and preserve faint ink. "
+                "Default 5 matches textcleaner's recommended default."
+            ),
+        )
         disable_dict = st.checkbox(
             "Disable Tesseract dictionary",
             value=False,
@@ -417,7 +436,7 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
             ),
         )
     return (
-        model_key, dpi, psm, show_images, preprocess, use_textcleaner,
+        model_key, dpi, psm, show_images, preprocess, use_textcleaner, offset_pct,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     )
 
@@ -427,7 +446,7 @@ def main() -> None:
     st.title("Arabic PDF OCR")
 
     (
-        model_key, dpi, psm, show_images, preprocess, use_textcleaner,
+        model_key, dpi, psm, show_images, preprocess, use_textcleaner, offset_pct,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     ) = render_sidebar()
 
@@ -471,7 +490,7 @@ def main() -> None:
     file_results: list[dict] = []
     for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{use_textcleaner}_{psm}_{model_key}_{disable_dict}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{use_textcleaner}_{offset_pct}_{psm}_{model_key}_{disable_dict}"
 
         if cache_key not in st.session_state["results"]:
             total_pages = _get_page_count(pdf_bytes)
@@ -488,7 +507,7 @@ def main() -> None:
                 except Exception as exc:
                     page_texts.append(f"[Failed to render page {page_num}: {exc}]")
                     continue
-                work_img = preprocess_image(img, dpi, use_textcleaner) if preprocess else img
+                work_img = preprocess_image(img, dpi, use_textcleaner, offset_pct) if preprocess else img
                 page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir, disable_dict))
                 del img, work_img  # free the large raster before next page
                 progress_bar.progress(
@@ -531,6 +550,7 @@ def main() -> None:
                     pdf_bytes=pdf_bytes,
                     preprocess=preprocess,
                     use_textcleaner=use_textcleaner,
+                    offset_pct=offset_pct,
                 )
                 raw_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
             st.divider()
