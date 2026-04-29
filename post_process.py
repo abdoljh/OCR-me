@@ -1,6 +1,8 @@
 import re
 from typing import NamedTuple
 
+from confusables import apply_word_corrections
+
 _WESTERN_TO_INDIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
 # Footnote marker: )1( or (1) or )١( with optional leading bidi/space
@@ -80,6 +82,8 @@ def clean_pages(
     pages: list[str],
     move_footnotes: bool = True,
     arabic_indic_numerals: bool = False,
+    apply_corrections: bool = False,
+    extra_corrections: dict[str, str] | None = None,
 ) -> CleanResult:
     """Post-process raw OCR page texts into a clean document.
 
@@ -87,6 +91,13 @@ def clean_pages(
     continuations (last block of page N with first block of page N+1 when
     no sentence terminator), optionally extracts footnotes, and converts
     Western→Arabic-Indic numerals on request.
+
+    Parameters
+    ----------
+    apply_corrections:
+        Apply word-level OCR correction dictionary from confusables.py.
+    extra_corrections:
+        Additional caller-supplied {ocr_token: correct_token} mappings.
     """
     pages_blocks: list[list[str]] = []
     all_footnotes: list[str] = []
@@ -105,4 +116,7 @@ def clean_pages(
                 pages_blocks[i + 1] = pages_blocks[i + 1][1:]
 
     all_blocks = [block for page in pages_blocks for block in page]
-    return CleanResult(body='\n\n'.join(all_blocks), footnotes=all_footnotes)
+    body = '\n\n'.join(all_blocks)
+    if apply_corrections:
+        body = apply_word_corrections(body, extra=extra_corrections)
+    return CleanResult(body=body, footnotes=all_footnotes)

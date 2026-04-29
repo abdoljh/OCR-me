@@ -329,14 +329,29 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, bool, bool]:
             value=False,
             help="Converts Western digits (0–9) → Arabic-Indic (٠–٩) in the cleaned output.",
         )
-    return model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic, disable_dict
+        apply_corrections = st.checkbox(
+            "Apply OCR corrections",
+            value=False,
+            help=(
+                "Fixes systematic Tesseract artefacts identified from ground-truth comparison "
+                "(e.g. 'قِ' → 'في'). Conservative: only corrects tokens that are clearly "
+                "not valid Arabic words."
+            ),
+        )
+    return (
+        model_key, dpi, psm, show_images, preprocess,
+        move_footnotes, arabic_indic, disable_dict, apply_corrections,
+    )
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    model_key, dpi, psm, show_images, preprocess, move_footnotes, arabic_indic, disable_dict = render_sidebar()
+    (
+        model_key, dpi, psm, show_images, preprocess,
+        move_footnotes, arabic_indic, disable_dict, apply_corrections,
+    ) = render_sidebar()
 
     # Resolve language model (downloads if needed)
     info = LANG_MODELS[model_key]
@@ -456,6 +471,7 @@ def main() -> None:
                 fr["pages"],
                 move_footnotes=move_footnotes,
                 arabic_indic_numerals=arabic_indic,
+                apply_corrections=apply_corrections,
             )
             if clean_result.body:
                 if len(file_results) > 1:
