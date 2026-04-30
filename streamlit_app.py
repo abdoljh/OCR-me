@@ -1,9 +1,10 @@
 import io
 import hashlib
+import zipfile
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
 from pdf2image import convert_from_bytes
 from scipy.ndimage import (zoom as _zoom, percentile_filter,
                             affine_transform, gaussian_filter,
@@ -16,13 +17,6 @@ MAX_DPI = 600
 
 def get_file_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
-
-
-@st.cache_data(show_spinner=False)
-def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
-    return convert_from_bytes(
-        pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num
-    )[0]
 
 
 @st.cache_data(show_spinner=False)
@@ -44,7 +38,24 @@ def _get_page_count(pdf_bytes: bytes) -> int:
     return len(convert_from_bytes(pdf_bytes, dpi=36))
 
 
-def nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
+@st.cache_data(show_spinner=False)
+def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
+    return convert_from_bytes(
+        pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num
+    )[0]
+
+
+@st.cache_data(show_spinner=False)
+def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int) -> bytes:
+    """Render and binarize one page; return PNG bytes. Cached per (file, page, dpi, threshold)."""
+    img = _render_page(pdf_bytes, page_num, dpi)
+    bw = _nlbin(img, threshold=threshold_pct / 100.0)
+    buf = io.BytesIO()
+    bw.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
     """Non-linear binarization — port of kraken's nlbin algorithm."""
     img = img.convert("L")
     raw = np.array(img, dtype=float) / 255.0
@@ -81,6 +92,33 @@ def nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
     return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
 
 
+def _build_pdf(png_bytes_list: list[bytes], dpi: int) -> bytes:
+    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
+    buf = io.BytesIO()
+    images[0].save(
+        buf, format="PDF", save_all=True, append_images=images[1:], resolution=dpi
+    )
+    return buf.getvalue()
+
+
+def _build_zip(png_bytes_list: list[bytes], stem: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, png_bytes in enumerate(png_bytes_list, 1):
+            zf.writestr(f"{stem}_page{i:03d}.png", png_bytes)
+    return buf.getvalue()
+
+
+def _build_tiff(png_bytes_list: list[bytes]) -> bytes:
+    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
+    buf = io.BytesIO()
+    images[0].save(
+        buf, format="TIFF", save_all=True, append_images=images[1:],
+        compression="tiff_deflate",
+    )
+    return buf.getvalue()
+
+
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF Binarizer", page_icon="📄", layout="wide")
     st.title("Arabic PDF Binarizer")
@@ -103,7 +141,8 @@ def main() -> None:
             step=5,
             help=(
                 "nlbin threshold (default 50 = 0.50). "
-                "Increase if faint strokes disappear; decrease if background bleeds in."
+                "Increase if faint strokes disappear; "
+                "decrease if background noise bleeds in."
             ),
         )
 
@@ -117,10 +156,10 @@ def main() -> None:
         st.info("Upload a PDF file to begin.")
         return
 
-    threshold = threshold_pct / 100.0
-
     for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
+        file_hash = get_file_hash(pdf_bytes)
+        stem = file_obj.name.removesuffix(".pdf")
         st.header(file_obj.name)
 
         try:
@@ -129,32 +168,67 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        progress = st.progress(0, text=f"Rendering page 1 of {total}…")
+        # ── Render and binarize all pages (cached per page) ──────────────
+        all_bw_bytes: list[bytes] = []
+        progress = st.progress(0, text=f"Page 1 of {total}…")
         for page_num in range(1, total + 1):
-            progress.progress(page_num / total, text=f"Rendering page {page_num} of {total}…")
+            progress.progress(
+                page_num / total, text=f"Page {page_num} of {total}…"
+            )
             try:
-                orig = _render_page(pdf_bytes, page_num, dpi)
+                bw_bytes = _binarize_page(pdf_bytes, page_num, dpi, threshold_pct)
             except Exception as exc:
-                st.error(f"Page {page_num}: render failed — {exc}")
+                st.error(f"Page {page_num}: failed — {exc}")
                 continue
+            all_bw_bytes.append(bw_bytes)
 
-            bw = nlbin(orig, threshold=threshold)
-
+            orig = _render_page(pdf_bytes, page_num, dpi)
+            bw   = Image.open(io.BytesIO(bw_bytes))
             col_orig, col_bin = st.columns(2)
-            col_orig.image(orig, use_container_width=True, caption=f"Page {page_num} — original")
-            col_bin.image(bw, use_container_width=True, caption=f"Page {page_num} — binarized")
-
-            buf = io.BytesIO()
-            bw.save(buf, format="PNG")
+            col_orig.image(orig, use_container_width=True,
+                           caption=f"Page {page_num} — original")
+            col_bin.image(bw,   use_container_width=True,
+                          caption=f"Page {page_num} — binarized")
             col_bin.download_button(
-                label=f"Download page {page_num} (PNG)",
-                data=buf.getvalue(),
-                file_name=f"{file_obj.name}_page{page_num:03d}.png",
+                label=f"↓ Page {page_num} (PNG)",
+                data=bw_bytes,
+                file_name=f"{stem}_page{page_num:03d}.png",
                 mime="image/png",
-                key=f"dl_{get_file_hash(pdf_bytes)}_{page_num}",
+                key=f"png_{file_hash}_{page_num}",
             )
 
         progress.empty()
+
+        # ── Bulk downloads ────────────────────────────────────────────────
+        if all_bw_bytes:
+            st.markdown("**Download all pages as:**")
+            col_pdf, col_tiff, col_zip = st.columns(3)
+
+            col_pdf.download_button(
+                label="PDF",
+                data=_build_pdf(all_bw_bytes, dpi),
+                file_name=f"{stem}_binarized.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"pdf_{file_hash}",
+            )
+            col_tiff.download_button(
+                label="Multi-page TIFF",
+                data=_build_tiff(all_bw_bytes),
+                file_name=f"{stem}_binarized.tiff",
+                mime="image/tiff",
+                use_container_width=True,
+                key=f"tiff_{file_hash}",
+            )
+            col_zip.download_button(
+                label="ZIP (PNG per page)",
+                data=_build_zip(all_bw_bytes, stem),
+                file_name=f"{stem}_binarized.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key=f"zip_{file_hash}",
+            )
+
         st.divider()
 
 
