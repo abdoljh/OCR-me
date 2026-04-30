@@ -1,8 +1,10 @@
 import io
 import hashlib
+import os
 import zipfile
 
 import numpy as np
+import pytesseract
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
@@ -13,6 +15,7 @@ from scipy.ndimage import (zoom as _zoom, percentile_filter,
 DEFAULT_DPI = 300
 MIN_DPI = 150
 MAX_DPI = 600
+TESSDATA_CACHE = os.path.expanduser("~/.tessdata_custom")
 
 
 def get_file_hash(data: bytes) -> str:
@@ -43,6 +46,20 @@ def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
     return convert_from_bytes(
         pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num
     )[0]
+
+
+@st.cache_data(show_spinner=False)
+def _ocr_page(bw_bytes: bytes) -> str:
+    """Run Tesseract on a binarized page image. Cached."""
+    img = Image.open(io.BytesIO(bw_bytes))
+    if os.path.exists(os.path.join(TESSDATA_CACHE, "ara.traineddata")):
+        cfg = f'--oem 1 --psm 4 --tessdata-dir "{TESSDATA_CACHE}"'
+    else:
+        cfg = "--oem 1 --psm 4"
+    try:
+        return pytesseract.image_to_string(img, lang="ara", config=cfg)
+    except Exception as exc:
+        return f"[OCR error: {exc}]"
 
 
 @st.cache_data(show_spinner=False)
@@ -90,6 +107,11 @@ def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
         flat /= (hi - lo)
     flat = np.clip(flat, 0, 1)
     return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
+
+
+def _build_txt(texts: list[str], stem: str) -> bytes:
+    parts = [f"=== {stem} — Page {i} ===\n{t.strip()}" for i, t in enumerate(texts, 1)]
+    return "\n\n".join(parts).encode("utf-8")
 
 
 def _build_pdf(png_bytes_list: list[bytes], dpi: int) -> bytes:
@@ -168,8 +190,9 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # ── Render and binarize all pages (cached per page) ──────────────
+        # ── Render, binarize and OCR all pages (each step cached) ────────
         all_bw_bytes: list[bytes] = []
+        all_texts: list[str] = []
         progress = st.progress(0, text=f"Page 1 of {total}…")
         for page_num in range(1, total + 1):
             progress.progress(
@@ -181,6 +204,7 @@ def main() -> None:
                 st.error(f"Page {page_num}: failed — {exc}")
                 continue
             all_bw_bytes.append(bw_bytes)
+            all_texts.append(_ocr_page(bw_bytes))
 
             orig = _render_page(pdf_bytes, page_num, dpi)
             bw   = Image.open(io.BytesIO(bw_bytes))
@@ -202,8 +226,16 @@ def main() -> None:
         # ── Bulk downloads ────────────────────────────────────────────────
         if all_bw_bytes:
             st.markdown("**Download all pages as:**")
-            col_pdf, col_tiff, col_zip = st.columns(3)
+            col_txt, col_pdf, col_tiff, col_zip = st.columns(4)
 
+            col_txt.download_button(
+                label="TXT",
+                data=_build_txt(all_texts, stem),
+                file_name=f"{stem}.txt",
+                mime="text/plain; charset=utf-8",
+                use_container_width=True,
+                key=f"txt_{file_hash}",
+            )
             col_pdf.download_button(
                 label="PDF",
                 data=_build_pdf(all_bw_bytes, dpi),
