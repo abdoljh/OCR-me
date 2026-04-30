@@ -1,5 +1,5 @@
 streamlit
-pytesseract
+kraken
 pdf2image
 Pillow
 numpy
