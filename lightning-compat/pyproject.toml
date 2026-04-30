@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightning"
+version = "2.6.1"
+requires-python = ">=3.10"
+dependencies = [
+    "pytorch-lightning==2.6.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
