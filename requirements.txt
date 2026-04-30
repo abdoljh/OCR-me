@@ -1,6 +1,6 @@
 streamlit
 torch>=2.4.0,<=2.10.0
-lightning~=2.6.0
+lightning @ ./lightning-compat
 kraken==7.0.1
 pdf2image
 Pillow
