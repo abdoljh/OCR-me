@@ -4,8 +4,9 @@ import subprocess
 import tempfile
 import urllib.request
 
+import numpy as np
 import streamlit as st
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 from pdf2image import convert_from_bytes
 
@@ -118,57 +119,73 @@ def _remove_alpha(img: Image.Image) -> Image.Image:
     return Image.alpha_composite(background, rgba).convert('RGB')
 
 
-def _textcleaner_core(img: Image.Image, dpi: int, offset_pct: int = 5) -> Image.Image:
+def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
     """
-    Background cleaning via local-area thresholding — replicates textcleaner defaults.
+    Non-linear binarization — port of kraken's nlbin algorithm.
 
-    Pipeline (matches textcleaner's core ImageMagick command):
-      1. autocontrast  (= -contrast-stretch 0 / -e stretch)
-      2. estimate local background with a box blur
-      3. pixels significantly darker than local background → text (kept)
-         everything else → pure white
+    Estimates the local background with a downscaled percentile filter
+    (80th percentile over a 20-pixel neighbourhood), subtracts it from the
+    image, then applies a global threshold on the residual.  Handles uneven
+    illumination and paper yellowing without DPI calibration.
 
-    filter_size scales with DPI so it always exceeds Arabic stroke width
-    (~3–6 px per 300 DPI) while staying well below inter-line spacing.
-    offset_pct: noise-elimination threshold (textcleaner -o); lower values
-    clean more aggressively, higher values preserve more background detail.
+    threshold: binarisation cutoff on the background-subtracted image.
+    Higher values classify more pixels as text (more aggressive cleaning).
+    Default 0.5 matches the kraken upstream default.
     """
+    from scipy.ndimage import (zoom as _zoom, percentile_filter,
+                                affine_transform, gaussian_filter,
+                                binary_dilation)
     assert img.mode == 'L'
+    raw = np.array(img, dtype=float) / 255.0
+    image = raw - raw.min()
+    if image.max() == 0:
+        return img
+    image /= image.max()
 
-    # 1. Contrast-stretch: map darkest→0, brightest→255
-    stretched = ImageOps.autocontrast(img, cutoff=0)
+    # Background estimation: downscale → 2-pass percentile filter → upscale
+    m = _zoom(image, 0.5)
+    m = percentile_filter(m, 80, size=(20, 2))
+    m = percentile_filter(m, 80, size=(2, 20))
+    mh, mw = m.shape
+    oh, ow = image.shape
+    m = affine_transform(m, np.diag([mh / oh, mw / ow]), output_shape=image.shape)
+    w = min(image.shape[0], m.shape[0])
+    h = min(image.shape[1], m.shape[1])
+    flat = np.clip(image[:w, :h] - m[:w, :h] + 1, 0, 1)
 
-    # 2. Local background estimate via box blur
-    #    filter_size must be > stroke width; 30 px at 300 DPI scales linearly
-    filter_size = max(15, int(30 * dpi / 300))
-    background_est = stretched.filter(ImageFilter.BoxBlur(filter_size // 2))
-
-    # 3. Difference: large where pixel is darker than local background (= text)
-    diff = ImageChops.subtract(background_est, stretched)   # clip(bg - px, 0, 255)
-
-    # 4. Threshold the diff with a LUT (much faster than a Python lambda)
-    offset_val = int(offset_pct * 255 / 100)
-    lut = [255 if x > offset_val else 0 for x in range(256)]
-    text_mask = diff.point(lut)
-
-    # 5. Composite: text pixels from stretched image, pure white everywhere else
-    white = Image.new('L', img.size, 255)
-    return Image.composite(stretched, white, text_mask)
+    # Adaptive threshold from central region with high local variance
+    d0, d1 = flat.shape
+    o0, o1 = int(0.1 * d0), int(0.1 * d1)
+    est = flat[o0:d0 - o0, o1:d1 - o1]
+    v = est - gaussian_filter(est, 20.0)
+    v = gaussian_filter(v ** 2, 20.0) ** 0.5
+    v = v > 0.3 * v.max()
+    v = binary_dilation(v, structure=np.ones((50, 1)))
+    v = binary_dilation(v, structure=np.ones((1, 50)))
+    est = est[v]
+    if est.size == 0:
+        lo, hi = 0.0, 1.0
+    else:
+        lo = np.percentile(est, 5)
+        hi = np.percentile(est, 90)
+    flat -= lo
+    if hi > lo:
+        flat /= (hi - lo)
+    flat = np.clip(flat, 0, 1)
+    return Image.fromarray(np.uint8(255 * (flat > threshold)), mode='L')
 
 
 def preprocess_image(
     img: Image.Image,
-    dpi: int = 300,
-    use_textcleaner: bool = True,
-    offset_pct: int = 5,
+    use_nlbin: bool = True,
+    threshold_pct: int = 50,
 ) -> Image.Image:
     img = _remove_alpha(img)
     img = img.convert("L")
-    if use_textcleaner:
-        img = _textcleaner_core(img, dpi, offset_pct)
+    if use_nlbin:
+        img = _nlbin(img, threshold=threshold_pct / 100.0)
     else:
         img = ImageEnhance.Contrast(img).enhance(2.0)
-    # Unsharp mask sharpens dot features after background has been cleaned.
     img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
     return img
 
@@ -315,16 +332,16 @@ def render_page_result(
     show_image: bool,
     pdf_bytes: bytes,
     preprocess: bool = False,
-    use_textcleaner: bool = False,
-    offset_pct: int = 5,
+    use_nlbin: bool = False,
+    threshold_pct: int = 50,
 ) -> None:
     st.subheader(f"Page {page_num} of {total}")
     if show_image:
         orig = _render_display_page(pdf_bytes, page_num)
-        # Add a white border so BoxBlur has a clean margin → no edge black spots
+        # White border keeps nlbin's percentile filter away from the image edge
         bordered = ImageOps.expand(orig, border=15, fill=(255, 255, 255))
         if preprocess:
-            cleaned = preprocess_image(bordered, DISPLAY_DPI, use_textcleaner, offset_pct)
+            cleaned = preprocess_image(bordered, use_nlbin, threshold_pct)
             col_orig, col_clean = st.columns(2)
             col_orig.image(orig, use_container_width=True, caption="Original")
             col_clean.image(cleaned, use_container_width=True, caption="After preprocessing")
@@ -339,7 +356,7 @@ def render_page_result(
     )
 
 
-def render_sidebar() -> tuple[str, int, int, bool, bool, bool, int, bool, bool, bool, bool]:
+def render_sidebar() -> tuple[str, int, int, bool, bool, bool, int, bool, bool, bool, bool]:  # noqa: E501
     with st.sidebar:
         st.header("Settings")
         model_key = st.selectbox(
@@ -378,31 +395,31 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, int, bool, bool, 
             value=True,
             help="Converts to grayscale and boosts contrast. Recommended for most Arabic documents.",
         )
-        use_textcleaner = st.checkbox(
-            "Clean background (textcleaner LAT)",
+        use_nlbin = st.checkbox(
+            "Advanced binarization (nlbin)",
             value=True,
             disabled=not preprocess,
             help=(
-                "Removes uneven background, paper yellowing, and scan noise using "
-                "local-area thresholding — a Python re-implementation of Fred Weinhaus's "
-                "textcleaner script. Each pixel is compared against its local neighbourhood "
-                "mean; background regions are replaced with pure white while text is kept. "
-                "Requires 'Enhance contrast' to be enabled. "
-                "Enable 'Show page images' to preview the before/after effect."
+                "Applies kraken's non-linear binarization algorithm before OCR. "
+                "Estimates the local background using a downscaled percentile filter, "
+                "subtracts it, then thresholds the residual — handling uneven "
+                "illumination and paper yellowing far better than a simple contrast "
+                "boost. Requires 'Enhance contrast' to be enabled. "
+                "Enable 'Show page images' to compare before and after."
             ),
         )
-        offset_pct = st.slider(
-            "Cleaning aggressiveness (offset %)",
-            min_value=1,
-            max_value=20,
-            value=5,
-            step=1,
-            disabled=not (preprocess and use_textcleaner),
+        threshold_pct = st.slider(
+            "Binarization threshold",
+            min_value=10,
+            max_value=90,
+            value=50,
+            step=5,
+            disabled=not (preprocess and use_nlbin),
             help=(
-                "Controls the textcleaner noise-elimination threshold (textcleaner -o). "
-                "Lower values clean more aggressively (remove more background); "
-                "higher values are more conservative and preserve faint ink. "
-                "Default 5 matches textcleaner's recommended default."
+                "Controls the nlbin binarisation cutoff (default 50 = 0.50). "
+                "Higher values classify more pixels as text — use when faint strokes "
+                "are lost. Lower values produce a cleaner white background — use when "
+                "background noise bleeds into the text."
             ),
         )
         disable_dict = st.checkbox(
@@ -436,7 +453,7 @@ def render_sidebar() -> tuple[str, int, int, bool, bool, bool, int, bool, bool, 
             ),
         )
     return (
-        model_key, dpi, psm, show_images, preprocess, use_textcleaner, offset_pct,
+        model_key, dpi, psm, show_images, preprocess, use_nlbin, threshold_pct,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     )
 
@@ -446,7 +463,7 @@ def main() -> None:
     st.title("Arabic PDF OCR")
 
     (
-        model_key, dpi, psm, show_images, preprocess, use_textcleaner, offset_pct,
+        model_key, dpi, psm, show_images, preprocess, use_nlbin, threshold_pct,
         move_footnotes, arabic_indic, disable_dict, apply_corrections,
     ) = render_sidebar()
 
@@ -490,7 +507,7 @@ def main() -> None:
     file_results: list[dict] = []
     for file_obj in uploaded_files:
         pdf_bytes = file_obj.read()
-        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{use_textcleaner}_{offset_pct}_{psm}_{model_key}_{disable_dict}"
+        cache_key = f"{get_file_hash(pdf_bytes)}_{dpi}_{preprocess}_{use_nlbin}_{threshold_pct}_{psm}_{model_key}_{disable_dict}"
 
         if cache_key not in st.session_state["results"]:
             total_pages = _get_page_count(pdf_bytes)
@@ -507,7 +524,7 @@ def main() -> None:
                 except Exception as exc:
                     page_texts.append(f"[Failed to render page {page_num}: {exc}]")
                     continue
-                work_img = preprocess_image(img, dpi, use_textcleaner, offset_pct) if preprocess else img
+                work_img = preprocess_image(img, use_nlbin, threshold_pct) if preprocess else img
                 page_texts.append(ocr_page(work_img, psm, dpi, lang, tessdata_dir, disable_dict))
                 del img, work_img  # free the large raster before next page
                 progress_bar.progress(
@@ -549,8 +566,8 @@ def main() -> None:
                     show_image=show_images,
                     pdf_bytes=pdf_bytes,
                     preprocess=preprocess,
-                    use_textcleaner=use_textcleaner,
-                    offset_pct=offset_pct,
+                    use_nlbin=use_nlbin,
+                    threshold_pct=threshold_pct,
                 )
                 raw_parts.append(f"=== {filename} — Page {page_num} of {total} ===\n{text}")
             st.divider()
