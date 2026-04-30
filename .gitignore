@@ -1,5 +1,8 @@
 .streamlit/secrets.toml
 
+# Downloaded OCR model files (large binaries, fetched at runtime)
+*.mlmodel
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
