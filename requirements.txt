@@ -1,5 +1,7 @@
 streamlit
-kraken
+torch
+lightning
+kraken==7.0.0b7
 pdf2image
 Pillow
 numpy
