@@ -1,10 +1,11 @@
 import io
 import hashlib
 import os
+import urllib.request
+import warnings
 import zipfile
 
 import numpy as np
-import pytesseract
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
@@ -15,17 +16,32 @@ from scipy.ndimage import (zoom as _zoom, percentile_filter,
 DEFAULT_DPI = 300
 MIN_DPI = 150
 MAX_DPI = 600
-TESSDATA_CACHE = os.path.expanduser("~/.tessdata_custom")
+
+_MODEL_URL = (
+    "https://raw.githubusercontent.com/OpenITI/AOCP_print_models"
+    "/refs/heads/main/transcription/apt-20221130.mlmodel"
+)
+_MODEL_PATH = os.path.expanduser("~/.kraken_models/apt-20221130.mlmodel")
 
 
 def get_file_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+@st.cache_resource(show_spinner=False)
+def _load_model():
+    """Download the Arabic model once and keep it in memory."""
+    os.makedirs(os.path.dirname(_MODEL_PATH), exist_ok=True)
+    if not os.path.exists(_MODEL_PATH):
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+    from kraken.lib import models as kraken_models
+    return kraken_models.load_any(_MODEL_PATH)
+
+
 @st.cache_data(show_spinner=False)
 def _get_page_count(pdf_bytes: bytes) -> int:
     try:
-        import subprocess, tempfile, os
+        import subprocess, tempfile
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp = f.name
@@ -49,27 +65,30 @@ def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
 
 
 @st.cache_data(show_spinner=False)
-def _ocr_page(bw_bytes: bytes) -> str:
-    """Run Tesseract on a binarized page image. Cached."""
-    img = Image.open(io.BytesIO(bw_bytes))
-    if os.path.exists(os.path.join(TESSDATA_CACHE, "ara.traineddata")):
-        cfg = f'--oem 1 --psm 4 --tessdata-dir "{TESSDATA_CACHE}"'
-    else:
-        cfg = "--oem 1 --psm 4"
-    try:
-        return pytesseract.image_to_string(img, lang="ara", config=cfg)
-    except Exception as exc:
-        return f"[OCR error: {exc}]"
-
-
-@st.cache_data(show_spinner=False)
 def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int) -> bytes:
-    """Render and binarize one page; return PNG bytes. Cached per (file, page, dpi, threshold)."""
+    """Render and binarize one page; return PNG bytes. Cached."""
     img = _render_page(pdf_bytes, page_num, dpi)
     bw = _nlbin(img, threshold=threshold_pct / 100.0)
     buf = io.BytesIO()
     bw.save(buf, format="PNG")
     return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def _ocr_page(bw_bytes: bytes) -> str:
+    """Run kraken OCR on a binarized page image. Cached."""
+    from kraken import blla, rpred
+    model = _load_model()
+    img = Image.open(io.BytesIO(bw_bytes))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        seg = blla.segment(img, text_direction="horizontal-rl")
+        lines = [
+            r.prediction
+            for r in rpred.rpred(model, img, seg)
+            if r.prediction.strip()
+        ]
+    return "\n".join(lines)
 
 
 def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
@@ -117,9 +136,15 @@ def _build_txt(texts: list[str], stem: str) -> bytes:
 def _build_pdf(png_bytes_list: list[bytes], dpi: int) -> bytes:
     images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
     buf = io.BytesIO()
-    images[0].save(
-        buf, format="PDF", save_all=True, append_images=images[1:], resolution=dpi
-    )
+    images[0].save(buf, format="PDF", save_all=True, append_images=images[1:], resolution=dpi)
+    return buf.getvalue()
+
+
+def _build_tiff(png_bytes_list: list[bytes]) -> bytes:
+    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
+    buf = io.BytesIO()
+    images[0].save(buf, format="TIFF", save_all=True, append_images=images[1:],
+                   compression="tiff_deflate")
     return buf.getvalue()
 
 
@@ -131,16 +156,6 @@ def _build_zip(png_bytes_list: list[bytes], stem: str) -> bytes:
     return buf.getvalue()
 
 
-def _build_tiff(png_bytes_list: list[bytes]) -> bytes:
-    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
-    buf = io.BytesIO()
-    images[0].save(
-        buf, format="TIFF", save_all=True, append_images=images[1:],
-        compression="tiff_deflate",
-    )
-    return buf.getvalue()
-
-
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF Binarizer", page_icon="📄", layout="wide")
     st.title("Arabic PDF Binarizer")
@@ -149,18 +164,12 @@ def main() -> None:
         st.header("Settings")
         dpi = st.slider(
             "Rendering DPI",
-            min_value=MIN_DPI,
-            max_value=MAX_DPI,
-            value=DEFAULT_DPI,
-            step=50,
+            min_value=MIN_DPI, max_value=MAX_DPI, value=DEFAULT_DPI, step=50,
             help="Higher DPI = sharper image, slower rendering.",
         )
         threshold_pct = st.slider(
             "Binarization threshold",
-            min_value=10,
-            max_value=90,
-            value=50,
-            step=5,
+            min_value=10, max_value=90, value=50, step=5,
             help=(
                 "nlbin threshold (default 50 = 0.50). "
                 "Increase if faint strokes disappear; "
@@ -168,10 +177,16 @@ def main() -> None:
             ),
         )
 
+    # Pre-load model so the spinner appears before the user uploads
+    with st.spinner("Loading Arabic OCR model…"):
+        try:
+            _load_model()
+        except Exception as exc:
+            st.error(f"Could not load OCR model: {exc}")
+            return
+
     uploaded_files = st.file_uploader(
-        "Upload PDF file(s)",
-        type=["pdf"],
-        accept_multiple_files=True,
+        "Upload PDF file(s)", type=["pdf"], accept_multiple_files=True,
     )
 
     if not uploaded_files:
@@ -190,29 +205,26 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # ── Render, binarize and OCR all pages (each step cached) ────────
         all_bw_bytes: list[bytes] = []
         all_texts: list[str] = []
         progress = st.progress(0, text=f"Page 1 of {total}…")
+
         for page_num in range(1, total + 1):
-            progress.progress(
-                page_num / total, text=f"Page {page_num} of {total}…"
-            )
+            progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
             try:
                 bw_bytes = _binarize_page(pdf_bytes, page_num, dpi, threshold_pct)
             except Exception as exc:
-                st.error(f"Page {page_num}: failed — {exc}")
+                st.error(f"Page {page_num}: binarization failed — {exc}")
                 continue
+
             all_bw_bytes.append(bw_bytes)
             all_texts.append(_ocr_page(bw_bytes))
 
             orig = _render_page(pdf_bytes, page_num, dpi)
-            bw   = Image.open(io.BytesIO(bw_bytes))
+            bw = Image.open(io.BytesIO(bw_bytes))
             col_orig, col_bin = st.columns(2)
-            col_orig.image(orig, use_container_width=True,
-                           caption=f"Page {page_num} — original")
-            col_bin.image(bw,   use_container_width=True,
-                          caption=f"Page {page_num} — binarized")
+            col_orig.image(orig, use_container_width=True, caption=f"Page {page_num} — original")
+            col_bin.image(bw,   use_container_width=True, caption=f"Page {page_num} — binarized")
             col_bin.download_button(
                 label=f"↓ Page {page_num} (PNG)",
                 data=bw_bytes,
@@ -223,11 +235,9 @@ def main() -> None:
 
         progress.empty()
 
-        # ── Bulk downloads ────────────────────────────────────────────────
         if all_bw_bytes:
             st.markdown("**Download all pages as:**")
             col_txt, col_pdf, col_tiff, col_zip = st.columns(4)
-
             col_txt.download_button(
                 label="TXT",
                 data=_build_txt(all_texts, stem),
