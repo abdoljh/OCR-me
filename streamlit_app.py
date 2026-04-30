@@ -1,7 +1,6 @@
 import io
 import hashlib
 import os
-import urllib.request
 import warnings
 import zipfile
 
@@ -17,25 +16,16 @@ DEFAULT_DPI = 300
 MIN_DPI = 150
 MAX_DPI = 600
 
-_MODEL_URL = (
-    "https://raw.githubusercontent.com/OpenITI/AOCP_print_models"
-    "/refs/heads/main/transcription/apt-20221130.mlmodel"
-)
-_MODEL_PATH = os.path.expanduser("~/.kraken_models/apt-20221130.mlmodel")
-
 
 def get_file_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
 @st.cache_resource(show_spinner=False)
-def _load_model():
-    """Download the Arabic model once and keep it in memory."""
-    os.makedirs(os.path.dirname(_MODEL_PATH), exist_ok=True)
-    if not os.path.exists(_MODEL_PATH):
-        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
-    from kraken.lib import models as kraken_models
-    return kraken_models.load_any(_MODEL_PATH)
+def _load_ocr_reader():
+    """Load EasyOCR Arabic reader once and keep it in memory."""
+    import easyocr
+    return easyocr.Reader(['ar'], gpu=False)
 
 
 @st.cache_data(show_spinner=False)
@@ -76,19 +66,13 @@ def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int
 
 @st.cache_data(show_spinner=False)
 def _ocr_page(bw_bytes: bytes) -> str:
-    """Run kraken OCR on a binarized page image. Cached."""
-    from kraken import blla, rpred
-    model = _load_model()
-    img = Image.open(io.BytesIO(bw_bytes))
+    """Run EasyOCR on a binarized page image. Cached."""
+    reader = _load_ocr_reader()
+    img = Image.open(io.BytesIO(bw_bytes)).convert("RGB")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        seg = blla.segment(img, text_direction="horizontal-rl")
-        lines = [
-            r.prediction
-            for r in rpred.rpred(model, img, seg)
-            if r.prediction.strip()
-        ]
-    return "\n".join(lines)
+        results = reader.readtext(np.array(img), detail=0, paragraph=True)
+    return "\n".join(results)
 
 
 def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
@@ -177,10 +161,9 @@ def main() -> None:
             ),
         )
 
-    # Pre-load model so the spinner appears before the user uploads
     with st.spinner("Loading Arabic OCR model…"):
         try:
-            _load_model()
+            _load_ocr_reader()
         except Exception as exc:
             st.error(f"Could not load OCR model: {exc}")
             return
