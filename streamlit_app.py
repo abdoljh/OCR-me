@@ -23,6 +23,15 @@ _MODEL_URL = (
 )
 _MODEL_PATH = os.path.expanduser("~/.kraken_models/apt-20221130.mlmodel")
 
+# Maps the UI bidi selection string to the value rpred expects.
+_BIDI_OPTIONS = {
+    "Auto — let kraken decide (True)": "auto",
+    "Force RTL — override to right-to-left ('R')": "R",
+    "Force LTR — override to left-to-right ('L')": "L",
+    "Off — raw display order (False)": "off",
+}
+_BIDI_TO_RPRED = {"auto": True, "R": "R", "L": "L", "off": False}
+
 
 def get_file_hash(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
@@ -66,7 +75,6 @@ def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
 
 @st.cache_data(show_spinner=False)
 def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int) -> bytes:
-    """Render and binarize one page; return PNG bytes. Cached."""
     img = _render_page(pdf_bytes, page_num, dpi)
     bw = _nlbin(img, threshold=threshold_pct / 100.0)
     buf = io.BytesIO()
@@ -75,20 +83,39 @@ def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int
 
 
 @st.cache_data(show_spinner=False)
-def _ocr_page(bw_bytes: bytes) -> str:
-    """Run kraken OCR on a binarized page image. Cached."""
-    from kraken import blla, rpred
+def _ocr_page(
+    bw_bytes: bytes,
+    # --- segmentation ---
+    text_direction: str = "horizontal-rl",
+    autocast: bool = False,
+    # --- recognition ---
+    pad: int = 16,
+    bidi_key: str = "auto",   # one of: "auto" | "R" | "L" | "off"
+    no_legacy_polygons: bool = False,
+    temperature: float = 1.0,
+) -> tuple[str, list[float]]:
+    """Run kraken segmentation + OCR. Returns (text, per-line confidences)."""
+    from kraken import blla, rpred as krpred
     model = _load_model()
+    model.temperature = temperature
     img = Image.open(io.BytesIO(bw_bytes))
+    bidi = _BIDI_TO_RPRED[bidi_key]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        seg = blla.segment(img, text_direction="horizontal-rl")
-        lines = [
-            r.prediction
-            for r in rpred.rpred(model, img, seg)
-            if r.prediction.strip()
-        ]
-    return "\n".join(lines)
+        seg = blla.segment(img, text_direction=text_direction, autocast=autocast)
+        records = list(krpred.rpred(
+            model, img, seg,
+            pad=pad,
+            bidi_reordering=bidi,
+            no_legacy_polygons=no_legacy_polygons,
+        ))
+    lines, confs = [], []
+    for r in records:
+        if r.prediction.strip():
+            lines.append(r.prediction)
+            avg_conf = float(np.mean(r.confidences)) if r.confidences else 0.0
+            confs.append(avg_conf)
+    return "\n".join(lines), confs
 
 
 def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
@@ -156,26 +183,121 @@ def _build_zip(png_bytes_list: list[bytes], stem: str) -> bytes:
     return buf.getvalue()
 
 
-def main() -> None:
-    st.set_page_config(page_title="Arabic PDF Binarizer", page_icon="📄", layout="wide")
-    st.title("Arabic PDF Binarizer")
-
+def _sidebar_settings() -> dict:
+    """Render all sidebar controls and return a dict of current values."""
     with st.sidebar:
         st.header("Settings")
+
+        # ── Image quality ────────────────────────────────────────────────
+        st.subheader("Image quality")
         dpi = st.slider(
-            "Rendering DPI",
-            min_value=MIN_DPI, max_value=MAX_DPI, value=DEFAULT_DPI, step=50,
-            help="Higher DPI = sharper image, slower rendering.",
+            "Rendering DPI", MIN_DPI, MAX_DPI, DEFAULT_DPI, step=50,
+            help="Higher DPI = sharper image but slower rendering and more memory.",
         )
         threshold_pct = st.slider(
-            "Binarization threshold",
-            min_value=10, max_value=90, value=50, step=5,
+            "Binarization threshold (nlbin)", 10, 90, 50, step=5,
             help=(
-                "nlbin threshold (default 50 = 0.50). "
-                "Increase if faint strokes disappear; "
-                "decrease if background noise bleeds in."
+                "nlbin ink/background threshold (0.10–0.90). "
+                "Raise if faint strokes vanish; lower if background noise bleeds in."
             ),
         )
+
+        # ── Segmentation ─────────────────────────────────────────────────
+        st.subheader("Segmentation (blla)")
+        text_direction = st.selectbox(
+            "Text direction",
+            ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
+            index=0,
+            help=(
+                "Primary reading direction passed to blla.segment(). "
+                "Arabic is right-to-left (horizontal-rl). "
+                "Affects the reading-order heuristic that sorts detected lines."
+            ),
+        )
+        autocast = st.checkbox(
+            "Autocast (mixed precision)",
+            value=False,
+            help=(
+                "Enable torch.autocast during segmentation inference. "
+                "May speed up GPU inference; usually no effect on CPU."
+            ),
+        )
+
+        # ── Recognition ──────────────────────────────────────────────────
+        st.subheader("Recognition (rpred)")
+        pad = st.slider(
+            "Line padding (px)", 0, 64, 16, step=4,
+            help=(
+                "Blank white pixels added to the left and right of each "
+                "extracted line image before it is fed to the model. "
+                "More padding gives the LSTM context at line edges; "
+                "too much pads with noise."
+            ),
+        )
+        bidi_label = st.selectbox(
+            "BiDi reordering",
+            list(_BIDI_OPTIONS.keys()),
+            index=0,
+            help=(
+                "Unicode bidirectional reordering applied to each output line. "
+                "'Auto' lets kraken detect direction per line. "
+                "'Force RTL/LTR' overrides. "
+                "'Off' returns raw display order (may reverse Arabic words)."
+            ),
+        )
+        bidi_key = _BIDI_OPTIONS[bidi_label]
+
+        no_legacy_polygons = st.checkbox(
+            "Force new polygon extractor",
+            value=False,
+            help=(
+                "If unchecked, kraken uses the polygon extractor the model was "
+                "trained with (legacy for older models). "
+                "Forcing the new extractor on a legacy-trained model may hurt accuracy "
+                "but can be useful for comparison."
+            ),
+        )
+        temperature = st.slider(
+            "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
+            help=(
+                "Scales logits before softmax: T<1 sharpens the distribution "
+                "(higher peak confidence), T>1 flattens it. "
+                "With greedy decoding the recognised characters do not change, "
+                "but per-character confidence scores do — useful for spotting "
+                "uncertain regions."
+            ),
+        )
+
+        # ── Active config summary ─────────────────────────────────────────
+        with st.expander("Active configuration", expanded=False):
+            st.json({
+                "dpi": dpi,
+                "nlbin_threshold": threshold_pct / 100,
+                "text_direction": text_direction,
+                "autocast": autocast,
+                "pad": pad,
+                "bidi_reordering": bidi_label.split("(")[0].strip(),
+                "no_legacy_polygons": no_legacy_polygons,
+                "temperature": temperature,
+            })
+
+    return dict(
+        dpi=dpi,
+        threshold_pct=threshold_pct,
+        text_direction=text_direction,
+        autocast=autocast,
+        pad=pad,
+        bidi_key=bidi_key,
+        no_legacy_polygons=no_legacy_polygons,
+        temperature=temperature,
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
+    st.title("Arabic PDF OCR")
+
+    cfg = _sidebar_settings()
 
     with st.spinner("Loading Arabic OCR model…"):
         try:
@@ -211,19 +333,38 @@ def main() -> None:
         for page_num in range(1, total + 1):
             progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
             try:
-                bw_bytes = _binarize_page(pdf_bytes, page_num, dpi, threshold_pct)
+                bw_bytes = _binarize_page(
+                    pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"]
+                )
             except Exception as exc:
                 st.error(f"Page {page_num}: binarization failed — {exc}")
                 continue
 
-            all_bw_bytes.append(bw_bytes)
-            all_texts.append(_ocr_page(bw_bytes))
+            try:
+                text, confs = _ocr_page(
+                    bw_bytes,
+                    text_direction=cfg["text_direction"],
+                    autocast=cfg["autocast"],
+                    pad=cfg["pad"],
+                    bidi_key=cfg["bidi_key"],
+                    no_legacy_polygons=cfg["no_legacy_polygons"],
+                    temperature=cfg["temperature"],
+                )
+            except Exception as exc:
+                st.error(f"Page {page_num}: OCR failed — {exc}")
+                text, confs = "", []
 
-            orig = _render_page(pdf_bytes, page_num, dpi)
+            all_bw_bytes.append(bw_bytes)
+            all_texts.append(text)
+
+            orig = _render_page(pdf_bytes, page_num, cfg["dpi"])
             bw = Image.open(io.BytesIO(bw_bytes))
+
             col_orig, col_bin = st.columns(2)
-            col_orig.image(orig, use_container_width=True, caption=f"Page {page_num} — original")
-            col_bin.image(bw,   use_container_width=True, caption=f"Page {page_num} — binarized")
+            col_orig.image(orig, use_container_width=True,
+                           caption=f"Page {page_num} — original")
+            col_bin.image(bw, use_container_width=True,
+                          caption=f"Page {page_num} — binarized")
             col_bin.download_button(
                 label=f"↓ Page {page_num} (PNG)",
                 data=bw_bytes,
@@ -231,6 +372,31 @@ def main() -> None:
                 mime="image/png",
                 key=f"png_{file_hash}_{page_num}",
             )
+
+            # OCR text + confidence for this page
+            with st.expander(
+                f"OCR text — Page {page_num}"
+                + (f"  |  avg confidence {np.mean(confs):.2%}" if confs else ""),
+                expanded=True,
+            ):
+                avg_conf = np.mean(confs) if confs else None
+                if avg_conf is not None and avg_conf < 0.60:
+                    st.warning(
+                        f"Low average confidence ({avg_conf:.1%}). "
+                        "Try adjusting DPI, threshold, or padding."
+                    )
+                st.text_area(
+                    label="",
+                    value=text,
+                    height=220,
+                    key=f"ocr_text_{file_hash}_{page_num}",
+                    help="Arabic text extracted by kraken (right-to-left).",
+                )
+                if confs:
+                    st.caption(
+                        f"{len(confs)} lines recognised — "
+                        f"min {min(confs):.1%} / mean {avg_conf:.1%} / max {max(confs):.1%}"
+                    )
 
         progress.empty()
 
@@ -247,7 +413,7 @@ def main() -> None:
             )
             col_pdf.download_button(
                 label="PDF",
-                data=_build_pdf(all_bw_bytes, dpi),
+                data=_build_pdf(all_bw_bytes, cfg["dpi"]),
                 file_name=f"{stem}_binarized.pdf",
                 mime="application/pdf",
                 use_container_width=True,
