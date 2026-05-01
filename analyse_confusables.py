@@ -7,8 +7,13 @@ Usage: python analyse_confusables.py
 """
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 import difflib
+
+# Sentinel returned by edit_distance when words differ too much to align.
+_EDIT_INFINITY = 99
+# Skip the full DP if word lengths differ by more than this — fast reject.
+_MAX_LENGTH_DIFF = 4
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +39,8 @@ def tokenise_arabic(text):
 
 def edit_distance(a, b):
     m, n = len(a), len(b)
-    if abs(m - n) > 4:
-        return 99
+    if abs(m - n) > _MAX_LENGTH_DIFF:
+        return _EDIT_INFINITY
     dp = list(range(n + 1))
     for i in range(1, m + 1):
         prev = dp[:]
@@ -76,10 +81,27 @@ def char_substitutions(ocr_word, gt_word):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main analysis
 # ---------------------------------------------------------------------------
 
-def analyse(ocr_text, gt_text, max_edit=2):
+def analyse(ocr_text, gt_text, max_edit=2, verbose=True):
+    """Align OCR output against ground truth and report character confusions.
+
+    Parameters
+    ----------
+    ocr_text, gt_text:
+        Raw text strings to compare.
+    max_edit:
+        Maximum edit distance for a word pair to be counted as a substitution.
+    verbose:
+        Print the confusion table and correction dictionary to stdout.
+        Set to False for programmatic/batch use.
+
+    Returns
+    -------
+    dict[str, str]
+        Word correction mapping for all pairs that appear ≥2 times.
+    """
     ocr_words = tokenise_arabic(normalise(ocr_text))
     gt_words  = tokenise_arabic(normalise(gt_text))
 
@@ -104,42 +126,38 @@ def analyse(ocr_text, gt_text, max_edit=2):
                             confusion[pair] += 1
 
     total_words = len(ocr_words)
-    print(f"OCR Arabic words total  : {total_words}")
-    print(f"Identical to GT         : {total_equal}  ({100*total_equal/total_words:.1f}%)")
-    print(f"Close replacements (≤{max_edit}ed): {sum(word_corrections.values())}")
-    print()
-
-    # ---- Character confusion table ----------------------------------------
-    print("CHARACTER SUBSTITUTION TABLE (OCR → Ground Truth)")
-    print(f"{'OCR':<12} → {'GT':<12} {'Count':>6}")
-    print("-" * 40)
-    for (oc, gc), cnt in confusion.most_common(30):
-        try: on = unicodedata.name(oc)
-        except: on = '?'
-        try: gn = unicodedata.name(gc)
-        except: gn = '?'
-        print(f"  {repr(oc):<8} → {repr(gc):<8} {cnt:>5}   {on} → {gn}")
-
-    # ---- Word correction dictionary ----------------------------------------
-    print()
-    print("WORD CORRECTION DICTIONARY")
-    print(f"  (OCR form → correct form, edit distance ≤ {max_edit}, sorted by frequency)")
-    print()
-    multi = {k: v for k, v in word_corrections.items() if v >= 2}
+    multi  = {k: v for k, v in word_corrections.items() if v >= 2}
     single = {k: v for k, v in word_corrections.items() if v == 1}
 
-    print(f"  Multi-occurrence pairs ({len(multi)}):")
-    for (ow, gw), cnt in sorted(multi.items(), key=lambda x: -x[1]):
-        print(f"    {repr(ow):<25} → {repr(gw):<25} ×{cnt}")
+    if verbose:
+        print(f"OCR Arabic words total  : {total_words}")
+        print(f"Identical to GT         : {total_equal}  ({100*total_equal/total_words:.1f}%)")
+        print(f"Close replacements (≤{max_edit}ed): {sum(word_corrections.values())}")
+        print()
 
-    print()
-    print(f"  Single-occurrence pairs ({len(single)}) — sample:")
-    for (ow, gw), cnt in list(sorted(single.items(), key=lambda x: x[0]))[:30]:
-        print(f"    {repr(ow):<25} → {repr(gw):<25}")
+        print("CHARACTER SUBSTITUTION TABLE (OCR → Ground Truth)")
+        print(f"{'OCR':<12} → {'GT':<12} {'Count':>6}")
+        print("-" * 40)
+        for (oc, gc), cnt in confusion.most_common(30):
+            try: on = unicodedata.name(oc)
+            except: on = '?'
+            try: gn = unicodedata.name(gc)
+            except: gn = '?'
+            print(f"  {repr(oc):<8} → {repr(gc):<8} {cnt:>5}   {on} → {gn}")
 
-    # Return all multi-occurrence pairs as the correction dict
-    correction_dict = {ow: gw for (ow, gw), cnt in multi.items()}
-    return correction_dict
+        print()
+        print("WORD CORRECTION DICTIONARY")
+        print(f"  (OCR form → correct form, edit distance ≤ {max_edit}, sorted by frequency)")
+        print()
+        print(f"  Multi-occurrence pairs ({len(multi)}):")
+        for (ow, gw), cnt in sorted(multi.items(), key=lambda x: -x[1]):
+            print(f"    {repr(ow):<25} → {repr(gw):<25} ×{cnt}")
+        print()
+        print(f"  Single-occurrence pairs ({len(single)}) — sample:")
+        for (ow, gw), _ in list(sorted(single.items(), key=lambda x: x[0]))[:30]:
+            print(f"    {repr(ow):<25} → {repr(gw):<25}")
+
+    return {ow: gw for (ow, gw) in multi}
 
 
 if __name__ == "__main__":

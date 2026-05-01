@@ -12,6 +12,7 @@ Design constraints:
 """
 
 import re
+from functools import lru_cache
 
 # ---------------------------------------------------------------------------
 # Base corrections — general Tesseract/Arabic OCR artefacts
@@ -39,9 +40,9 @@ GT_DERIVED_CORRECTIONS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Compiled pattern cache
+# Pattern builder — cached by frozenset of (token, correction) pairs
+# so the regex is compiled only once per unique correction dictionary.
 # ---------------------------------------------------------------------------
-_ARABIC = re.compile(r'[؀-ۿً-ٟـ]')
 
 def _build_pattern(corrections: dict[str, str]) -> re.Pattern | None:
     if not corrections:
@@ -52,6 +53,12 @@ def _build_pattern(corrections: dict[str, str]) -> re.Pattern | None:
     escaped = [re.escape(k) for k in keys]
     pattern = r'(?<![؀-ۿً-ٟـ])(?:' + '|'.join(escaped) + r')(?![؀-ۿً-ٟـ])'
     return re.compile(pattern)
+
+
+@lru_cache(maxsize=16)
+def _cached_pattern(frozen_items: tuple) -> re.Pattern | None:
+    """Build and cache a compiled regex for the given correction mapping."""
+    return _build_pattern(dict(frozen_items))
 
 
 def apply_word_corrections(
@@ -78,7 +85,8 @@ def apply_word_corrections(
     if extra:
         combined.update(extra)
 
-    pat = _build_pattern(combined)
+    # Sort items so the cache key is order-independent
+    pat = _cached_pattern(tuple(sorted(combined.items())))
     if pat is None:
         return text
 

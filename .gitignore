@@ -3,6 +3,14 @@
 # Downloaded OCR model files (large binaries, fetched at runtime)
 *.mlmodel
 
+# lightning-compat build artefacts (created by local pip install)
+lightning-compat/build/
+lightning-compat/*.egg-info/
+
+# Test script outputs
+test_kraken_tess_output.txt
+test_kraken_kraken_output.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

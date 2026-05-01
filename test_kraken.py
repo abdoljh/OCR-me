@@ -1,22 +1,33 @@
 """
-Kraken vs Tesseract accuracy comparison on Arabic PDF pages.
+kraken vs Tesseract accuracy comparison on Arabic PDF pages.
 
 Usage:
-    python3 test_kraken.py <model.mlmodel> [pages 5-10 of Preface.pdf]
+    python3 test_kraken.py <model.mlmodel> [pdf_path]
 
 The script:
   1. Renders pages 5-10 of samples/arabic01.pdf at 400 DPI
-  2. Runs kraken OCR using the supplied model
-  3. Runs Tesseract OCR (tessdata_best) on the same images
-  4. Compares both outputs against ground_truth.txt using analyse_confusables.py
-  5. Prints a side-by-side accuracy report
+  2. Binarizes each page with the same nlbin algorithm used by the app
+  3. Runs kraken OCR (blla segmentation + rpred recognition) using the supplied model
+  4. Runs Tesseract OCR (tessdata_best, PSM 4) on the same images
+  5. Compares both outputs against ground_truth.txt
+  6. Prints a side-by-side accuracy report
 
-Requirements: kraken, pytesseract, pdf2image, PIL
+Requirements (see requirements-dev.txt):
+    pip install pytesseract
+    apt install tesseract-ocr tesseract-ocr-ara
 """
 
 import sys
 import os
 import re
+import warnings
+import io
+
+import numpy as np
+from PIL import Image, ImageOps
+from pdf2image import convert_from_path
+from scipy.ndimage import (zoom as _zoom, percentile_filter,
+                            affine_transform, gaussian_filter, binary_dilation)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,10 +51,48 @@ print(f"Pages   : {FIRST_PAGE}–{LAST_PAGE}")
 print(f"DPI     : {DPI}")
 print()
 
+
+# ---------------------------------------------------------------------------
+# Binarization (same nlbin as streamlit_app.py)
+# ---------------------------------------------------------------------------
+
+def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
+    img = img.convert("L")
+    raw = np.array(img, dtype=float) / 255.0
+    image = raw - raw.min()
+    if image.max() == 0:
+        return img
+    image /= image.max()
+    m = _zoom(image, 0.5)
+    m = percentile_filter(m, 80, size=(20, 2))
+    m = percentile_filter(m, 80, size=(2, 20))
+    mh, mw = m.shape
+    oh, ow = image.shape
+    m = affine_transform(m, np.diag([mh / oh, mw / ow]), output_shape=image.shape)
+    w = min(image.shape[0], m.shape[0])
+    h = min(image.shape[1], m.shape[1])
+    flat = np.clip(image[:w, :h] - m[:w, :h] + 1, 0, 1)
+    d0, d1 = flat.shape
+    o0, o1 = int(0.1 * d0), int(0.1 * d1)
+    est = flat[o0:d0 - o0, o1:d1 - o1]
+    v = est - gaussian_filter(est, 20.0)
+    v = gaussian_filter(v ** 2, 20.0) ** 0.5
+    v = v > 0.3 * v.max()
+    v = binary_dilation(v, structure=np.ones((50, 1)))
+    v = binary_dilation(v, structure=np.ones((1, 50)))
+    est = est[v]
+    lo = np.percentile(est, 5) if est.size else 0.0
+    hi = np.percentile(est, 90) if est.size else 1.0
+    flat -= lo
+    if hi > lo:
+        flat /= (hi - lo)
+    flat = np.clip(flat, 0, 1)
+    return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
+
+
 # ---------------------------------------------------------------------------
 # Render pages
 # ---------------------------------------------------------------------------
-from pdf2image import convert_from_path
 print(f"Rendering pages {FIRST_PAGE}–{LAST_PAGE} at {DPI} DPI…")
 images = convert_from_path(PDF_PATH, dpi=DPI, first_page=FIRST_PAGE, last_page=LAST_PAGE)
 print(f"  {len(images)} pages rendered.")
@@ -52,50 +101,56 @@ print()
 # ---------------------------------------------------------------------------
 # Tesseract OCR (tessdata_best, PSM 4, OEM 1)
 # ---------------------------------------------------------------------------
-import pytesseract
-from PIL import ImageOps
+try:
+    import pytesseract
+except ImportError:
+    print("pytesseract not installed — skipping Tesseract comparison.")
+    print("Install it with: pip install pytesseract")
+    pytesseract = None
 
 TESSDATA_CACHE = os.path.expanduser("~/.tessdata_custom")
 TESS_CONFIG = f'--oem 1 --psm 4 --tessdata-dir "{TESSDATA_CACHE}"'
 TESS_LANG = "ara"
 
-# Verify tessdata_best is available
-if not os.path.exists(os.path.join(TESSDATA_CACHE, "ara.traineddata")):
+if pytesseract and not os.path.exists(os.path.join(TESSDATA_CACHE, "ara.traineddata")):
     print("tessdata_best not found — falling back to system Tesseract ara model")
     TESS_CONFIG = "--oem 1 --psm 4"
 
-print("Running Tesseract OCR…")
 tess_pages = []
-for i, img in enumerate(images, start=FIRST_PAGE):
-    # Apply the same preprocessing the app uses (grayscale + white border)
-    padded = ImageOps.expand(img, border=100, fill=(255, 255, 255))
-    text = pytesseract.image_to_string(padded, lang=TESS_LANG, config=TESS_CONFIG)
-    tess_pages.append(text)
-    print(f"  Page {i}: {len(text)} chars")
+if pytesseract:
+    print("Running Tesseract OCR…")
+    for i, img in enumerate(images, start=FIRST_PAGE):
+        padded = ImageOps.expand(img, border=100, fill=(255, 255, 255))
+        text = pytesseract.image_to_string(padded, lang=TESS_LANG, config=TESS_CONFIG)
+        tess_pages.append(text)
+        print(f"  Page {i}: {len(text)} chars")
+    print()
 
 tess_combined = "\n\n".join(tess_pages)
-print()
 
 # ---------------------------------------------------------------------------
-# Kraken OCR
+# kraken OCR  (kraken 7 API: blla.segment + rpred.rpred)
 # ---------------------------------------------------------------------------
-from kraken import binarization, pageseg, rpred
-from kraken.lib import models as kraken_models
+from kraken import blla, rpred as krpred
+from kraken.lib.models import load_any
 
 print(f"Loading kraken model: {MODEL_PATH}")
-model = kraken_models.load_any(MODEL_PATH)
-print(f"  Model loaded: {model}")
+model = load_any(MODEL_PATH)
+print(f"  Model loaded.")
 print()
 
-print("Running Kraken OCR…")
+print("Running kraken OCR…")
 kraken_pages = []
 for i, img in enumerate(images, start=FIRST_PAGE):
-    bw = binarization.nlbin(img)
-    seg = pageseg.segment(bw)
-    lines = []
-    for record in rpred.rpred(model, bw, seg):
-        if record.prediction.strip():
-            lines.append(record.prediction)
+    bw = _nlbin(img)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        seg = blla.segment(bw, text_direction="horizontal-rl")
+        lines = [
+            r.prediction
+            for r in krpred.rpred(model, bw, seg)
+            if r.prediction.strip()
+        ]
     page_text = "\n".join(lines)
     kraken_pages.append(page_text)
     print(f"  Page {i}: {len(page_text)} chars, {len(lines)} lines")
@@ -108,12 +163,13 @@ print()
 # ---------------------------------------------------------------------------
 tess_out = os.path.join(HERE, "test_kraken_tess_output.txt")
 krak_out = os.path.join(HERE, "test_kraken_kraken_output.txt")
-with open(tess_out, "w", encoding="utf-8") as f:
-    f.write(tess_combined)
+if tess_combined:
+    with open(tess_out, "w", encoding="utf-8") as f:
+        f.write(tess_combined)
+    print(f"Tesseract output → {tess_out}")
 with open(krak_out, "w", encoding="utf-8") as f:
     f.write(kraken_combined)
-print(f"Tesseract output → {tess_out}")
-print(f"Kraken output    → {krak_out}")
+print(f"kraken output    → {krak_out}")
 print()
 
 # ---------------------------------------------------------------------------
@@ -121,15 +177,20 @@ print()
 # ---------------------------------------------------------------------------
 from analyse_confusables import analyse
 
+if not os.path.exists(GT_PATH):
+    print(f"Ground truth not found at {GT_PATH} — skipping accuracy comparison.")
+    sys.exit(0)
+
 with open(GT_PATH, encoding="utf-8") as f:
     gt_text = f.read()
 
-print("=" * 60)
-print("TESSERACT accuracy vs ground truth")
-print("=" * 60)
-tess_corr = analyse(tess_combined, gt_text)
+if tess_combined:
+    print("=" * 60)
+    print("TESSERACT accuracy vs ground truth")
+    print("=" * 60)
+    tess_corr = analyse(tess_combined, gt_text)
+    print()
 
-print()
 print("=" * 60)
 print("KRAKEN accuracy vs ground truth")
 print("=" * 60)
@@ -139,26 +200,29 @@ krak_corr = analyse(kraken_combined, gt_text)
 # Summary table
 # ---------------------------------------------------------------------------
 def word_accuracy(ocr_text, gt_text):
-    """Quick exact-match word accuracy for summary."""
-    import difflib
+    """Exact Arabic word match rate against ground truth."""
     arabic_re = re.compile(r'[؀-ۿً-ٟـ]+')
     ocr_words = arabic_re.findall(ocr_text)
     gt_words  = arabic_re.findall(gt_text)
     if not gt_words:
         return 0.0
+    import difflib
     m = difflib.SequenceMatcher(None, ocr_words, gt_words, autojunk=False)
     equal = sum(i2 - i1 for tag, i1, i2, j1, j2 in m.get_opcodes() if tag == 'equal')
     return equal / len(gt_words) * 100
 
-tess_acc = word_accuracy(tess_combined, gt_text)
 krak_acc = word_accuracy(kraken_combined, gt_text)
 
 print()
 print("=" * 60)
 print("SUMMARY (exact Arabic word match, pages 5–10)")
 print("=" * 60)
-print(f"  Tesseract (tessdata_best, PSM 4) : {tess_acc:.1f}%")
-print(f"  Kraken ({os.path.basename(MODEL_PATH):<25}) : {krak_acc:.1f}%")
-winner = "Kraken" if krak_acc > tess_acc else "Tesseract"
-diff = abs(krak_acc - tess_acc)
-print(f"  Winner: {winner} (+{diff:.1f} pp)")
+if tess_combined:
+    tess_acc = word_accuracy(tess_combined, gt_text)
+    print(f"  Tesseract (tessdata_best, PSM 4) : {tess_acc:.1f}%")
+    print(f"  kraken ({os.path.basename(MODEL_PATH):<25})  : {krak_acc:.1f}%")
+    winner = "kraken" if krak_acc > tess_acc else "Tesseract"
+    diff = abs(krak_acc - tess_acc)
+    print(f"  Winner: {winner} (+{diff:.1f} pp)")
+else:
+    print(f"  kraken ({os.path.basename(MODEL_PATH)}) : {krak_acc:.1f}%")

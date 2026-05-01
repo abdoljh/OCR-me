@@ -31,6 +31,8 @@ _BIDI_OPTIONS = {
     "Off — raw display order (False)": "off",
 }
 _BIDI_TO_RPRED = {"auto": True, "R": "R", "L": "L", "off": False}
+# Reverse map: internal key → short display name for the config JSON snapshot.
+_BIDI_SHORT = {v: k.split(" —")[0] for k, v in _BIDI_OPTIONS.items()}
 
 
 def get_file_hash(data: bytes) -> str:
@@ -97,6 +99,9 @@ def _ocr_page(
     """Run kraken segmentation + OCR. Returns (text, per-line confidences)."""
     from kraken import blla, rpred as krpred
     model = _load_model()
+    # temperature is set on every cache miss; cached results replay the stored
+    # return value without re-running this body, so the mutation is safe for
+    # single-session use. Multi-user deployments should use the task-model API.
     model.temperature = temperature
     img = Image.open(io.BytesIO(bw_bytes))
     bidi = _BIDI_TO_RPRED[bidi_key]
@@ -155,19 +160,22 @@ def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
     return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
 
 
-def _build_txt(texts: list[str], stem: str) -> bytes:
+@st.cache_data(show_spinner=False)
+def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
     parts = [f"=== {stem} — Page {i} ===\n{t.strip()}" for i, t in enumerate(texts, 1)]
     return "\n\n".join(parts).encode("utf-8")
 
 
-def _build_pdf(png_bytes_list: list[bytes], dpi: int) -> bytes:
+@st.cache_data(show_spinner=False)
+def _build_pdf(png_bytes_list: tuple[bytes, ...], dpi: int) -> bytes:
     images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
     buf = io.BytesIO()
     images[0].save(buf, format="PDF", save_all=True, append_images=images[1:], resolution=dpi)
     return buf.getvalue()
 
 
-def _build_tiff(png_bytes_list: list[bytes]) -> bytes:
+@st.cache_data(show_spinner=False)
+def _build_tiff(png_bytes_list: tuple[bytes, ...]) -> bytes:
     images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
     buf = io.BytesIO()
     images[0].save(buf, format="TIFF", save_all=True, append_images=images[1:],
@@ -175,7 +183,8 @@ def _build_tiff(png_bytes_list: list[bytes]) -> bytes:
     return buf.getvalue()
 
 
-def _build_zip(png_bytes_list: list[bytes], stem: str) -> bytes:
+@st.cache_data(show_spinner=False)
+def _build_zip(png_bytes_list: tuple[bytes, ...], stem: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, png_bytes in enumerate(png_bytes_list, 1):
@@ -276,7 +285,7 @@ def _sidebar_settings() -> dict:
                 "text_direction": text_direction,
                 "autocast": autocast,
                 "pad": pad,
-                "bidi_reordering": bidi_label.split("(")[0].strip(),
+                "bidi_reordering": _BIDI_SHORT[bidi_key],
                 "no_legacy_polygons": no_legacy_polygons,
                 "temperature": temperature,
             })
@@ -405,7 +414,7 @@ def main() -> None:
             col_txt, col_pdf, col_tiff, col_zip = st.columns(4)
             col_txt.download_button(
                 label="TXT",
-                data=_build_txt(all_texts, stem),
+                data=_build_txt(tuple(all_texts), stem),
                 file_name=f"{stem}.txt",
                 mime="text/plain; charset=utf-8",
                 use_container_width=True,
@@ -413,7 +422,7 @@ def main() -> None:
             )
             col_pdf.download_button(
                 label="PDF",
-                data=_build_pdf(all_bw_bytes, cfg["dpi"]),
+                data=_build_pdf(tuple(all_bw_bytes), cfg["dpi"]),
                 file_name=f"{stem}_binarized.pdf",
                 mime="application/pdf",
                 use_container_width=True,
@@ -421,7 +430,7 @@ def main() -> None:
             )
             col_tiff.download_button(
                 label="Multi-page TIFF",
-                data=_build_tiff(all_bw_bytes),
+                data=_build_tiff(tuple(all_bw_bytes)),
                 file_name=f"{stem}_binarized.tiff",
                 mime="image/tiff",
                 use_container_width=True,
@@ -429,7 +438,7 @@ def main() -> None:
             )
             col_zip.download_button(
                 label="ZIP (PNG per page)",
-                data=_build_zip(all_bw_bytes, stem),
+                data=_build_zip(tuple(all_bw_bytes), stem),
                 file_name=f"{stem}_binarized.zip",
                 mime="application/zip",
                 use_container_width=True,
