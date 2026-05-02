@@ -144,9 +144,18 @@ def _ocr_page(
             if temperature != 1.0:
                 cmd += ["-t", str(temperature)]
 
+            # Strip the project root from PYTHONPATH so the subprocess finds
+            # the installed kraken package, not any same-named local directory.
+            here = os.path.dirname(os.path.abspath(__file__))
+            env  = os.environ.copy()
+            env["PYTHONPATH"] = os.pathsep.join(
+                p for p in env.get("PYTHONPATH", "").split(os.pathsep)
+                if p and os.path.abspath(p) != here
+            )
+
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300
+                    cmd, capture_output=True, text=True, timeout=300, env=env
                 )
                 if proc.returncode == 0 and os.path.exists(txt_path):
                     with open(txt_path, encoding="utf-8") as f:
