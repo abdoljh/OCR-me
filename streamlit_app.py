@@ -9,9 +9,6 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
-from scipy.ndimage import (zoom as _zoom, percentile_filter,
-                            affine_transform, gaussian_filter,
-                            binary_dilation)
 
 DEFAULT_DPI = 300
 MIN_DPI = 150
@@ -77,8 +74,9 @@ def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
 
 @st.cache_data(show_spinner=False)
 def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int) -> bytes:
+    from kraken import binarization as kraken_bin
     img = _render_page(pdf_bytes, page_num, dpi)
-    bw = _nlbin(img, threshold=threshold_pct / 100.0)
+    bw = kraken_bin.nlbin(img, threshold=threshold_pct / 100.0)
     buf = io.BytesIO()
     bw.save(buf, format="PNG")
     return buf.getvalue()
@@ -121,43 +119,6 @@ def _ocr_page(
             avg_conf = float(np.mean(r.confidences)) if r.confidences else 0.0
             confs.append(avg_conf)
     return "\n".join(lines), confs
-
-
-def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
-    """Non-linear binarization — port of kraken's nlbin algorithm."""
-    img = img.convert("L")
-    raw = np.array(img, dtype=float) / 255.0
-    image = raw - raw.min()
-    if image.max() == 0:
-        return img
-    image /= image.max()
-
-    m = _zoom(image, 0.5)
-    m = percentile_filter(m, 80, size=(20, 2))
-    m = percentile_filter(m, 80, size=(2, 20))
-    mh, mw = m.shape
-    oh, ow = image.shape
-    m = affine_transform(m, np.diag([mh / oh, mw / ow]), output_shape=image.shape)
-    w = min(image.shape[0], m.shape[0])
-    h = min(image.shape[1], m.shape[1])
-    flat = np.clip(image[:w, :h] - m[:w, :h] + 1, 0, 1)
-
-    d0, d1 = flat.shape
-    o0, o1 = int(0.1 * d0), int(0.1 * d1)
-    est = flat[o0:d0 - o0, o1:d1 - o1]
-    v = est - gaussian_filter(est, 20.0)
-    v = gaussian_filter(v ** 2, 20.0) ** 0.5
-    v = v > 0.3 * v.max()
-    v = binary_dilation(v, structure=np.ones((50, 1)))
-    v = binary_dilation(v, structure=np.ones((1, 50)))
-    est = est[v]
-    lo = np.percentile(est, 5) if est.size else 0.0
-    hi = np.percentile(est, 90) if est.size else 1.0
-    flat -= lo
-    if hi > lo:
-        flat /= (hi - lo)
-    flat = np.clip(flat, 0, 1)
-    return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
 
 
 @st.cache_data(show_spinner=False)
