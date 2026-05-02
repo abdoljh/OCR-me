@@ -73,6 +73,14 @@ def _render_page(pdf_bytes: bytes, page_num: int, dpi: int) -> Image.Image:
 
 
 @st.cache_data(show_spinner=False)
+def _render_page_bytes(pdf_bytes: bytes, page_num: int, dpi: int) -> bytes:
+    """Return the original rendered page as PNG bytes (colour, for rpred)."""
+    buf = io.BytesIO()
+    _render_page(pdf_bytes, page_num, dpi).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
 def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int) -> bytes:
     from kraken import binarization as kraken_bin
     img = _render_page(pdf_bytes, page_num, dpi)
@@ -85,6 +93,7 @@ def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int
 @st.cache_data(show_spinner=False)
 def _ocr_page(
     bw_bytes: bytes,
+    orig_bytes: bytes,
     # --- segmentation ---
     text_direction: str = "horizontal-rl",
     autocast: bool = False,
@@ -94,20 +103,27 @@ def _ocr_page(
     no_legacy_polygons: bool = False,
     temperature: float = 1.0,
 ) -> tuple[str, list[float]]:
-    """Run kraken segmentation + OCR. Returns (text, per-line confidences)."""
+    """Run kraken segmentation + OCR. Returns (text, per-line confidences).
+
+    bw_bytes  → binary image used for BLLA baseline detection (geometric).
+    orig_bytes → original colour/grey page fed to the LSTM recogniser so it
+                 retains ink-density gradients that distinguish similar Arabic
+                 letterforms (ب/ن, ج/ح, ه/ة, ع/ف, …).
+    """
     from kraken import blla, rpred as krpred
     model = _load_model()
     # temperature is set on every cache miss; cached results replay the stored
     # return value without re-running this body, so the mutation is safe for
     # single-session use. Multi-user deployments should use the task-model API.
     model.temperature = temperature
-    img = Image.open(io.BytesIO(bw_bytes))
+    bw_img   = Image.open(io.BytesIO(bw_bytes))
+    orig_img = Image.open(io.BytesIO(orig_bytes))
     bidi = _BIDI_TO_RPRED[bidi_key]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        seg = blla.segment(img, text_direction=text_direction, autocast=autocast)
+        seg = blla.segment(bw_img, text_direction=text_direction, autocast=autocast)
         records = list(krpred.rpred(
-            model, img, seg,
+            model, orig_img, seg,
             pad=pad,
             bidi_reordering=bidi,
             no_legacy_polygons=no_legacy_polygons,
@@ -238,6 +254,18 @@ def _sidebar_settings() -> dict:
             ),
         )
 
+        # ── Post-processing ───────────────────────────────────────────────
+        st.subheader("Post-processing")
+        apply_corrections = st.checkbox(
+            "Apply word corrections",
+            value=False,
+            help=(
+                "Run confusables.py word substitutions on every recognised line "
+                "to fix systematic Arabic OCR errors (e.g. العكري→العسكري). "
+                "Only safe, high-precision corrections are applied."
+            ),
+        )
+
         # ── Active config summary ─────────────────────────────────────────
         with st.expander("Active configuration", expanded=False):
             st.json({
@@ -249,6 +277,7 @@ def _sidebar_settings() -> dict:
                 "bidi_reordering": _BIDI_SHORT[bidi_key],
                 "no_legacy_polygons": no_legacy_polygons,
                 "temperature": temperature,
+                "apply_corrections": apply_corrections,
             })
 
     return dict(
@@ -260,6 +289,7 @@ def _sidebar_settings() -> dict:
         bidi_key=bidi_key,
         no_legacy_polygons=no_legacy_polygons,
         temperature=temperature,
+        apply_corrections=apply_corrections,
     )
 
 
@@ -302,6 +332,7 @@ def main() -> None:
 
         for page_num in range(1, total + 1):
             progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
+            orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
             try:
                 bw_bytes = _binarize_page(
                     pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"]
@@ -313,6 +344,7 @@ def main() -> None:
             try:
                 text, confs = _ocr_page(
                     bw_bytes,
+                    orig_bytes,
                     text_direction=cfg["text_direction"],
                     autocast=cfg["autocast"],
                     pad=cfg["pad"],
@@ -324,10 +356,14 @@ def main() -> None:
                 st.error(f"Page {page_num}: OCR failed — {exc}")
                 text, confs = "", []
 
+            if cfg["apply_corrections"] and text:
+                from confusables import apply_word_corrections
+                text = apply_word_corrections(text, include_gt_derived=True)
+
             all_bw_bytes.append(bw_bytes)
             all_texts.append(text)
 
-            orig = _render_page(pdf_bytes, page_num, cfg["dpi"])
+            orig = Image.open(io.BytesIO(orig_bytes))
             bw = Image.open(io.BytesIO(bw_bytes))
 
             col_orig, col_bin = st.columns(2)
