@@ -119,28 +119,34 @@ def _ocr_page(
     )
     use_cli = bool(kraken_bin) and os.path.isfile(kraken_bin)
 
+    cli_stderr = ""   # captured for the fallback warning
+
     if use_cli:
         with tempfile.TemporaryDirectory() as tmpdir:
             img_path = os.path.join(tmpdir, "page.png")
             txt_path = os.path.join(tmpdir, "page.txt")
             Image.open(io.BytesIO(orig_bytes)).save(img_path, format="PNG")
 
+            # Match the documented pipeline:
+            #   kraken -i img.png out.txt segment -d DIR ocr -m MODEL ...
+            # Note: binarize is intentionally omitted — BLLA works directly on
+            # the colour render, and skipping it matches the Colab-verified flow.
             cmd = [
                 kraken_bin,
                 "-i", img_path, txt_path,
-                "binarize", "--threshold", f"{threshold_pct / 100:.2f}",
                 "segment", "-d", text_direction,
                 "ocr", "-m", _MODEL_PATH, "-p", str(pad),
             ]
-            # Bidi: --reorder (default) / --no-reorder / --base-dir R|L
+            # Bidi reordering
             if bidi_key == "off":
                 cmd.append("--no-reorder")
             elif bidi_key in ("R", "L"):
-                cmd += ["--base-dir", bidi_key]
-            # Legacy polygons flag lives on the ocr subcommand
+                cmd += ["--base-dir", bidi_key, "--reorder"]
+            else:
+                cmd.append("--reorder")   # auto: always enable reordering for Arabic
+            # Optional ocr flags
             if no_legacy_polygons:
                 cmd.append("--no-legacy-polygons")
-            # Temperature: -t on the ocr subcommand
             if temperature != 1.0:
                 cmd += ["-t", str(temperature)]
 
@@ -160,15 +166,18 @@ def _ocr_page(
                 if proc.returncode == 0 and os.path.exists(txt_path):
                     with open(txt_path, encoding="utf-8") as f:
                         return f.read().strip(), []
-                # CLI ran but failed — surface the error so we can debug
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"kraken CLI exited {proc.returncode}: {proc.stderr[:400]}"
-                    )
+                cli_stderr = proc.stderr  # save for warning; fall through below
             except subprocess.TimeoutExpired:
-                raise RuntimeError("kraken CLI timed out (>300 s)")
+                cli_stderr = "CLI timed out (>300 s)"
 
-    # ── Python API fallback (dev / CLI-not-available) ─────────────────────
+    # ── Python API fallback (dev / CLI-not-available / CLI-failed) ───────
+    # cli_stderr is non-empty when the CLI was found but failed.
+    if cli_stderr:
+        # Surface the CLI failure as a Streamlit warning (not an exception)
+        # so the user knows the fallback path was taken.
+        import streamlit as _st
+        _st.warning(f"kraken CLI failed — using Python API fallback.\n{cli_stderr[:300]}")
+
     from kraken import blla, binarization as _kbin, rpred as krpred
     model = _load_model()
     model.temperature = temperature
