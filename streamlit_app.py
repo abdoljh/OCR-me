@@ -150,18 +150,17 @@ def _ocr_page(
             if temperature != 1.0:
                 cmd += ["-t", str(temperature)]
 
-            # Strip the project root from PYTHONPATH so the subprocess finds
-            # the installed kraken package, not any same-named local directory.
-            here = os.path.dirname(os.path.abspath(__file__))
-            env  = os.environ.copy()
-            env["PYTHONPATH"] = os.pathsep.join(
-                p for p in env.get("PYTHONPATH", "").split(os.pathsep)
-                if p and os.path.abspath(p) != here
-            )
+            # Completely clear PYTHONPATH so the subprocess uses only the venv's
+            # site-packages and cannot pick up any local directory that shadows
+            # the installed kraken package (Streamlit may inject the project root
+            # via sitecustomize.py in addition to PYTHONPATH).
+            env = os.environ.copy()
+            env["PYTHONPATH"] = ""
 
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300, env=env
+                    cmd, capture_output=True, text=True, timeout=300,
+                    env=env, cwd=tmpdir,
                 )
                 if proc.returncode == 0 and os.path.exists(txt_path):
                     with open(txt_path, encoding="utf-8") as f:
@@ -176,7 +175,7 @@ def _ocr_page(
         # Surface the CLI failure as a Streamlit warning (not an exception)
         # so the user knows the fallback path was taken.
         import streamlit as _st
-        _st.warning(f"kraken CLI failed — using Python API fallback.\n{cli_stderr[:300]}")
+        _st.warning(f"kraken CLI failed — using Python API fallback.\n\n```\n{cli_stderr}\n```")
 
     from kraken import blla, binarization as _kbin, rpred as krpred
     model = _load_model()
