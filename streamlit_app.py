@@ -10,7 +10,7 @@ import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
 
-DEFAULT_DPI = 300
+DEFAULT_DPI = 400
 MIN_DPI = 150
 MAX_DPI = 600
 
@@ -137,13 +137,16 @@ def _ocr_page(
                 "segment", "-d", text_direction,
                 "ocr", "-m", _MODEL_PATH, "-p", str(pad),
             ]
-            # Bidi reordering
+            # Bidi reordering.
+            # For Arabic (RTL), --base-dir R gives better word ordering than
+            # Unicode auto-detect.  "auto" and "R" both use R as base; only
+            # explicit LTR or off deviates from this.
             if bidi_key == "off":
                 cmd.append("--no-reorder")
-            elif bidi_key in ("R", "L"):
-                cmd += ["--base-dir", bidi_key, "--reorder"]
-            else:
-                cmd.append("--reorder")   # auto: always enable reordering for Arabic
+            elif bidi_key == "L":
+                cmd += ["--base-dir", "L", "--reorder"]
+            else:  # "R" or "auto"
+                cmd += ["--base-dir", "R", "--reorder"]
             # Optional ocr flags
             if no_legacy_polygons:
                 cmd.append("--no-legacy-polygons")
