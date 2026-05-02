@@ -128,18 +128,21 @@ def _ocr_page(
             cmd = [
                 kraken_bin,
                 "-i", img_path, txt_path,
-                "binarize", "-t", f"{threshold_pct / 100:.2f}",
+                "binarize", "--threshold", f"{threshold_pct / 100:.2f}",
                 "segment", "-d", text_direction,
                 "ocr", "-m", _MODEL_PATH, "-p", str(pad),
             ]
-            # Bidi flags
+            # Bidi: --reorder (default) / --no-reorder / --base-dir R|L
             if bidi_key == "off":
-                cmd.append("--no-bidi")
+                cmd.append("--no-reorder")
             elif bidi_key in ("R", "L"):
-                cmd += ["--bidi-override", bidi_key]
-            # Temperature (skip when default to avoid unsupported-flag errors on older builds)
+                cmd += ["--base-dir", bidi_key]
+            # Legacy polygons flag lives on the ocr subcommand
+            if no_legacy_polygons:
+                cmd.append("--no-legacy-polygons")
+            # Temperature: -t on the ocr subcommand
             if temperature != 1.0:
-                cmd += ["-T", str(temperature)]
+                cmd += ["-t", str(temperature)]
 
             try:
                 proc = subprocess.run(
