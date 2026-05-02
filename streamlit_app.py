@@ -206,6 +206,68 @@ def _ocr_page(
     return "\n".join(lines), confs
 
 
+def _anthropic_key() -> str:
+    """Return Anthropic API key from Streamlit secrets or environment."""
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+@st.cache_data(show_spinner=False)
+def _ocr_page_claude(orig_bytes: bytes) -> tuple[str, list[float]]:
+    """Extract Arabic text from a page image using Claude Haiku vision.
+
+    Uses claude-haiku-4-5-20251001.  Handles both modern printed Arabic and
+    Quranic Uthmanic script.  Requires ANTHROPIC_API_KEY in Streamlit secrets
+    or the environment.  Cost: ~$0.004 per page at 400 DPI.
+    """
+    import anthropic
+    import base64
+
+    api_key = _anthropic_key()
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY not found. "
+            "Add it to Streamlit secrets (Settings → Secrets) or set the environment variable."
+        )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    img_b64 = base64.standard_b64encode(orig_bytes).decode()
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4096,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": img_b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract all Arabic text from this page image exactly as written.\n"
+                        "• Preserve all diacritical marks (tashkeel) precisely.\n"
+                        "• For Quranic pages: keep verse numbers in Arabic-Indic numerals "
+                        "  e.g. ﴿١٢٣﴾ or (١٢٣).\n"
+                        "• Separate paragraphs with a blank line.\n"
+                        "• Output ONLY the extracted text — no labels, commentary, "
+                        "  or translation."
+                    ),
+                },
+            ],
+        }],
+    )
+    return response.content[0].text.strip(), []
+
+
 @st.cache_data(show_spinner=False)
 def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
     parts = [f"=== {stem} — Page {i} ===\n{t.strip()}" for i, t in enumerate(texts, 1)]
@@ -243,85 +305,93 @@ def _sidebar_settings() -> dict:
     with st.sidebar:
         st.header("Settings")
 
+        # ── OCR Engine ────────────────────────────────────────────────────
+        st.subheader("OCR Engine")
+        engine_label = st.selectbox(
+            "Engine",
+            ["Claude Haiku (API, ~$0.004/page)", "kraken (offline, free)"],
+            index=0,
+            help=(
+                "Claude Haiku: near-perfect Arabic OCR, handles modern print and "
+                "Quranic Uthmanic script with full tashkeel. Requires "
+                "ANTHROPIC_API_KEY in Streamlit secrets.\n\n"
+                "kraken: fully offline, no API key needed. Good for modern printed "
+                "Arabic; struggles with Quranic script and decorative fonts."
+            ),
+        )
+        engine = "claude" if engine_label.startswith("Claude") else "kraken"
+
+        if engine == "claude" and not _anthropic_key():
+            st.warning(
+                "ANTHROPIC_API_KEY not set — kraken will be used as fallback. "
+                "Add the key in **Settings → Secrets** to enable Claude.",
+                icon="⚠️",
+            )
+
         # ── Image quality ────────────────────────────────────────────────
         st.subheader("Image quality")
         dpi = st.slider(
             "Rendering DPI", MIN_DPI, MAX_DPI, DEFAULT_DPI, step=50,
-            help="Higher DPI = sharper image but slower rendering and more memory.",
-        )
-        threshold_pct = st.slider(
-            "Binarization threshold (nlbin)", 10, 90, 50, step=5,
-            help=(
-                "nlbin ink/background threshold (0.10–0.90). "
-                "Raise if faint strokes vanish; lower if background noise bleeds in."
-            ),
+            help="Higher DPI = sharper image. Affects both the preview and the image sent to the OCR engine.",
         )
 
-        # ── Segmentation ─────────────────────────────────────────────────
-        st.subheader("Segmentation (blla)")
-        text_direction = st.selectbox(
-            "Text direction",
-            ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
-            index=0,
-            help=(
-                "Primary reading direction passed to blla.segment(). "
-                "Arabic is right-to-left (horizontal-rl). "
-                "Affects the reading-order heuristic that sorts detected lines."
-            ),
+        # ── kraken settings ───────────────────────────────────────────────
+        # Always rendered (widgets must exist for their values to be returned),
+        # but collapsed when Claude is the active engine.
+        kraken_section_label = (
+            "kraken settings (fallback)" if engine == "claude" else "kraken settings"
         )
-        autocast = st.checkbox(
-            "Autocast (mixed precision)",
-            value=False,
-            help=(
-                "Enable torch.autocast during segmentation inference. "
-                "May speed up GPU inference; usually no effect on CPU."
-            ),
-        )
-
-        # ── Recognition ──────────────────────────────────────────────────
-        st.subheader("Recognition (rpred)")
-        pad = st.slider(
-            "Line padding (px)", 0, 64, 16, step=4,
-            help=(
-                "Blank white pixels added to the left and right of each "
-                "extracted line image before it is fed to the model. "
-                "More padding gives the LSTM context at line edges; "
-                "too much pads with noise."
-            ),
-        )
-        bidi_label = st.selectbox(
-            "BiDi reordering",
-            list(_BIDI_OPTIONS.keys()),
-            index=0,
-            help=(
-                "Unicode bidirectional reordering applied to each output line. "
-                "'Auto' lets kraken detect direction per line. "
-                "'Force RTL/LTR' overrides. "
-                "'Off' returns raw display order (may reverse Arabic words)."
-            ),
-        )
-        bidi_key = _BIDI_OPTIONS[bidi_label]
-
-        no_legacy_polygons = st.checkbox(
-            "Force new polygon extractor",
-            value=False,
-            help=(
-                "If unchecked, kraken uses the polygon extractor the model was "
-                "trained with (legacy for older models). "
-                "Forcing the new extractor on a legacy-trained model may hurt accuracy "
-                "but can be useful for comparison."
-            ),
-        )
-        temperature = st.slider(
-            "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
-            help=(
-                "Scales logits before softmax: T<1 sharpens the distribution "
-                "(higher peak confidence), T>1 flattens it. "
-                "With greedy decoding the recognised characters do not change, "
-                "but per-character confidence scores do — useful for spotting "
-                "uncertain regions."
-            ),
-        )
+        with st.expander(kraken_section_label, expanded=(engine == "kraken")):
+            threshold_pct = st.slider(
+                "Binarization threshold (nlbin)", 10, 90, 50, step=5,
+                help=(
+                    "nlbin ink/background threshold (0.10–0.90). "
+                    "Raise if faint strokes vanish; lower if background noise bleeds in."
+                ),
+            )
+            text_direction = st.selectbox(
+                "Text direction",
+                ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
+                index=0,
+                help=(
+                    "Primary reading direction passed to blla.segment(). "
+                    "Arabic is right-to-left (horizontal-rl)."
+                ),
+            )
+            autocast = st.checkbox(
+                "Autocast (mixed precision)",
+                value=False,
+                help="Enable torch.autocast during segmentation. Usually no effect on CPU.",
+            )
+            pad = st.slider(
+                "Line padding (px)", 0, 64, 16, step=4,
+                help=(
+                    "Blank pixels added to each line edge before recognition. "
+                    "More padding gives the LSTM context at line boundaries."
+                ),
+            )
+            bidi_label = st.selectbox(
+                "BiDi reordering",
+                list(_BIDI_OPTIONS.keys()),
+                index=0,
+                help=(
+                    "Unicode bidirectional reordering applied to each output line. "
+                    "'Auto' lets kraken detect direction per line."
+                ),
+            )
+            bidi_key = _BIDI_OPTIONS[bidi_label]
+            no_legacy_polygons = st.checkbox(
+                "Force new polygon extractor",
+                value=False,
+                help="Override polygon extractor; may hurt accuracy on older models.",
+            )
+            temperature = st.slider(
+                "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
+                help=(
+                    "Scales logits before softmax. Affects confidence scores only, "
+                    "not which characters are recognised."
+                ),
+            )
 
         # ── Post-processing ───────────────────────────────────────────────
         st.subheader("Post-processing")
@@ -329,27 +399,32 @@ def _sidebar_settings() -> dict:
             "Apply word corrections",
             value=False,
             help=(
-                "Run confusables.py word substitutions on every recognised line "
-                "to fix systematic Arabic OCR errors (e.g. العكري→العسكري). "
-                "Only safe, high-precision corrections are applied."
+                "Run confusables.py word substitutions to fix systematic OCR errors "
+                "(tatweel stripping, فى→في, بنفه→بنفسه, etc.). "
+                "Useful with kraken; Claude usually produces these correctly already."
             ),
         )
 
         # ── Active config summary ─────────────────────────────────────────
         with st.expander("Active configuration", expanded=False):
-            st.json({
-                "dpi": dpi,
-                "nlbin_threshold": threshold_pct / 100,
-                "text_direction": text_direction,
-                "autocast": autocast,
-                "pad": pad,
-                "bidi_reordering": _BIDI_SHORT[bidi_key],
-                "no_legacy_polygons": no_legacy_polygons,
-                "temperature": temperature,
-                "apply_corrections": apply_corrections,
-            })
+            cfg_json: dict = {"engine": engine, "dpi": dpi}
+            if engine == "claude":
+                cfg_json["model"] = "claude-haiku-4-5-20251001"
+            else:
+                cfg_json.update({
+                    "nlbin_threshold": threshold_pct / 100,
+                    "text_direction": text_direction,
+                    "autocast": autocast,
+                    "pad": pad,
+                    "bidi_reordering": _BIDI_SHORT[bidi_key],
+                    "no_legacy_polygons": no_legacy_polygons,
+                    "temperature": temperature,
+                })
+            cfg_json["apply_corrections"] = apply_corrections
+            st.json(cfg_json)
 
     return dict(
+        engine=engine,
         dpi=dpi,
         threshold_pct=threshold_pct,
         text_direction=text_direction,
@@ -368,12 +443,15 @@ def main() -> None:
 
     cfg = _sidebar_settings()
 
-    with st.spinner("Loading Arabic OCR model…"):
-        try:
-            _load_model()
-        except Exception as exc:
-            st.error(f"Could not load OCR model: {exc}")
-            return
+    # Preload the kraken model only when it is the active engine.
+    # When Claude is selected the model loads lazily on first fallback only.
+    if cfg["engine"] == "kraken":
+        with st.spinner("Loading Arabic OCR model…"):
+            try:
+                _load_model()
+            except Exception as exc:
+                st.error(f"Could not load OCR model: {exc}")
+                return
 
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)", type=["pdf"], accept_multiple_files=True,
@@ -404,20 +482,34 @@ def main() -> None:
             orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
             bw_bytes   = _binarize_page(pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"])
 
-            try:
-                text, confs = _ocr_page(
-                    orig_bytes,
-                    threshold_pct=cfg["threshold_pct"],
-                    text_direction=cfg["text_direction"],
-                    autocast=cfg["autocast"],
-                    pad=cfg["pad"],
-                    bidi_key=cfg["bidi_key"],
-                    no_legacy_polygons=cfg["no_legacy_polygons"],
-                    temperature=cfg["temperature"],
-                )
-            except Exception as exc:
-                st.error(f"Page {page_num}: OCR failed — {exc}")
-                text, confs = "", []
+            text, confs = "", []
+            if cfg["engine"] == "claude":
+                try:
+                    text, confs = _ocr_page_claude(orig_bytes)
+                except Exception as claude_exc:
+                    st.warning(
+                        f"Page {page_num}: Claude failed — falling back to kraken.\n"
+                        f"{claude_exc}",
+                        icon="⚠️",
+                    )
+                    cfg["engine"] = "kraken"   # switch for remaining pages too
+
+            if cfg["engine"] == "kraken":
+                try:
+                    _load_model()   # no-op after first load (cached)
+                    text, confs = _ocr_page(
+                        orig_bytes,
+                        threshold_pct=cfg["threshold_pct"],
+                        text_direction=cfg["text_direction"],
+                        autocast=cfg["autocast"],
+                        pad=cfg["pad"],
+                        bidi_key=cfg["bidi_key"],
+                        no_legacy_polygons=cfg["no_legacy_polygons"],
+                        temperature=cfg["temperature"],
+                    )
+                except Exception as exc:
+                    st.error(f"Page {page_num}: OCR failed — {exc}")
+                    text, confs = "", []
 
             if cfg["apply_corrections"] and text:
                 from confusables import apply_word_corrections
@@ -454,12 +546,15 @@ def main() -> None:
                         f"Low average confidence ({avg_conf:.1%}). "
                         "Try adjusting DPI, threshold, or padding."
                     )
+                engine_name = (
+                    "Claude Haiku" if cfg["engine"] == "claude" else "kraken"
+                )
                 st.text_area(
                     label="",
                     value=text,
                     height=220,
                     key=f"ocr_text_{file_hash}_{page_num}",
-                    help="Arabic text extracted by kraken (right-to-left).",
+                    help=f"Arabic text extracted by {engine_name}.",
                 )
                 if confs:
                     st.caption(
