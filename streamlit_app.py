@@ -92,32 +92,78 @@ def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int
 
 @st.cache_data(show_spinner=False)
 def _ocr_page(
-    bw_bytes: bytes,
     orig_bytes: bytes,
-    # --- segmentation ---
+    threshold_pct: int = 50,
     text_direction: str = "horizontal-rl",
     autocast: bool = False,
-    # --- recognition ---
     pad: int = 16,
-    bidi_key: str = "auto",   # one of: "auto" | "R" | "L" | "off"
+    bidi_key: str = "auto",
     no_legacy_polygons: bool = False,
     temperature: float = 1.0,
 ) -> tuple[str, list[float]]:
-    """Run kraken segmentation + OCR. Returns (text, per-line confidences).
+    """Full kraken pipeline: binarize → segment → ocr.
 
-    bw_bytes  → binary image used for BLLA baseline detection (geometric).
-    orig_bytes → original colour/grey page fed to the LSTM recogniser so it
-                 retains ink-density gradients that distinguish similar Arabic
-                 letterforms (ب/ن, ج/ح, ه/ة, ع/ف, …).
+    Prefers the kraken CLI (the exact pipeline from the documentation):
+        kraken -i page.png out.txt binarize segment ocr -m model.mlmodel
+    Falls back to the Python API when the CLI is not on PATH (dev environments).
+
+    orig_bytes: original colour/grey page render — the CLI binarises this itself;
+                the Python-API fallback also binarises internally before segmenting.
     """
-    from kraken import blla, rpred as krpred
+    import shutil, subprocess, sys, tempfile
+
+    # ── Locate the kraken CLI ─────────────────────────────────────────────
+    # When installed via pip the script lives next to the Python executable.
+    kraken_bin = shutil.which("kraken") or os.path.join(
+        os.path.dirname(sys.executable), "kraken"
+    )
+    use_cli = bool(kraken_bin) and os.path.isfile(kraken_bin)
+
+    if use_cli:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, "page.png")
+            txt_path = os.path.join(tmpdir, "page.txt")
+            Image.open(io.BytesIO(orig_bytes)).save(img_path, format="PNG")
+
+            cmd = [
+                kraken_bin,
+                "-i", img_path, txt_path,
+                "binarize", "-t", f"{threshold_pct / 100:.2f}",
+                "segment", "-d", text_direction,
+                "ocr", "-m", _MODEL_PATH, "-p", str(pad),
+            ]
+            # Bidi flags
+            if bidi_key == "off":
+                cmd.append("--no-bidi")
+            elif bidi_key in ("R", "L"):
+                cmd += ["--bidi-override", bidi_key]
+            # Temperature (skip when default to avoid unsupported-flag errors on older builds)
+            if temperature != 1.0:
+                cmd += ["-T", str(temperature)]
+
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=300
+                )
+                if proc.returncode == 0 and os.path.exists(txt_path):
+                    with open(txt_path, encoding="utf-8") as f:
+                        return f.read().strip(), []
+                # CLI ran but failed — surface the error so we can debug
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"kraken CLI exited {proc.returncode}: {proc.stderr[:400]}"
+                    )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("kraken CLI timed out (>300 s)")
+
+    # ── Python API fallback (dev / CLI-not-available) ─────────────────────
+    from kraken import blla, binarization as _kbin, rpred as krpred
     model = _load_model()
-    # temperature is set on every cache miss; cached results replay the stored
-    # return value without re-running this body, so the mutation is safe for
-    # single-session use. Multi-user deployments should use the task-model API.
     model.temperature = temperature
-    bw_img   = Image.open(io.BytesIO(bw_bytes))
+
     orig_img = Image.open(io.BytesIO(orig_bytes))
+    bw_img   = _kbin.nlbin(orig_img, threshold=threshold_pct / 100.0)
+
     bidi = _BIDI_TO_RPRED[bidi_key]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -333,18 +379,12 @@ def main() -> None:
         for page_num in range(1, total + 1):
             progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
             orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
-            try:
-                bw_bytes = _binarize_page(
-                    pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"]
-                )
-            except Exception as exc:
-                st.error(f"Page {page_num}: binarization failed — {exc}")
-                continue
+            bw_bytes   = _binarize_page(pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"])
 
             try:
                 text, confs = _ocr_page(
-                    bw_bytes,
                     orig_bytes,
+                    threshold_pct=cfg["threshold_pct"],
                     text_direction=cfg["text_direction"],
                     autocast=cfg["autocast"],
                     pad=cfg["pad"],
@@ -364,7 +404,7 @@ def main() -> None:
             all_texts.append(text)
 
             orig = Image.open(io.BytesIO(orig_bytes))
-            bw = Image.open(io.BytesIO(bw_bytes))
+            bw   = Image.open(io.BytesIO(bw_bytes))
 
             col_orig, col_bin = st.columns(2)
             col_orig.image(orig, use_container_width=True,
