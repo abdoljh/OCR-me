@@ -6,7 +6,7 @@ Usage:
 
 The script:
   1. Renders pages 5-10 of samples/arabic01.pdf at 400 DPI
-  2. Binarizes each page with the same nlbin algorithm used by the app
+  2. Binarizes each page with kraken.binarization.nlbin (same as the app)
   3. Runs kraken OCR (blla segmentation + rpred recognition) using the supplied model
   4. Runs Tesseract OCR (tessdata_best, PSM 4) on the same images
   5. Compares both outputs against ground_truth.txt
@@ -26,8 +26,6 @@ import io
 import numpy as np
 from PIL import Image, ImageOps
 from pdf2image import convert_from_path
-from scipy.ndimage import (zoom as _zoom, percentile_filter,
-                            affine_transform, gaussian_filter, binary_dilation)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -50,44 +48,6 @@ print(f"PDF     : {PDF_PATH}")
 print(f"Pages   : {FIRST_PAGE}–{LAST_PAGE}")
 print(f"DPI     : {DPI}")
 print()
-
-
-# ---------------------------------------------------------------------------
-# Binarization (same nlbin as streamlit_app.py)
-# ---------------------------------------------------------------------------
-
-def _nlbin(img: Image.Image, threshold: float = 0.5) -> Image.Image:
-    img = img.convert("L")
-    raw = np.array(img, dtype=float) / 255.0
-    image = raw - raw.min()
-    if image.max() == 0:
-        return img
-    image /= image.max()
-    m = _zoom(image, 0.5)
-    m = percentile_filter(m, 80, size=(20, 2))
-    m = percentile_filter(m, 80, size=(2, 20))
-    mh, mw = m.shape
-    oh, ow = image.shape
-    m = affine_transform(m, np.diag([mh / oh, mw / ow]), output_shape=image.shape)
-    w = min(image.shape[0], m.shape[0])
-    h = min(image.shape[1], m.shape[1])
-    flat = np.clip(image[:w, :h] - m[:w, :h] + 1, 0, 1)
-    d0, d1 = flat.shape
-    o0, o1 = int(0.1 * d0), int(0.1 * d1)
-    est = flat[o0:d0 - o0, o1:d1 - o1]
-    v = est - gaussian_filter(est, 20.0)
-    v = gaussian_filter(v ** 2, 20.0) ** 0.5
-    v = v > 0.3 * v.max()
-    v = binary_dilation(v, structure=np.ones((50, 1)))
-    v = binary_dilation(v, structure=np.ones((1, 50)))
-    est = est[v]
-    lo = np.percentile(est, 5) if est.size else 0.0
-    hi = np.percentile(est, 90) if est.size else 1.0
-    flat -= lo
-    if hi > lo:
-        flat /= (hi - lo)
-    flat = np.clip(flat, 0, 1)
-    return Image.fromarray(np.uint8(255 * (flat > threshold)), mode="L")
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +91,7 @@ tess_combined = "\n\n".join(tess_pages)
 # ---------------------------------------------------------------------------
 # kraken OCR  (kraken 7 API: blla.segment + rpred.rpred)
 # ---------------------------------------------------------------------------
-from kraken import blla, rpred as krpred
+from kraken import blla, rpred as krpred, binarization as kraken_bin
 from kraken.lib.models import load_any
 
 print(f"Loading kraken model: {MODEL_PATH}")
@@ -142,7 +102,7 @@ print()
 print("Running kraken OCR…")
 kraken_pages = []
 for i, img in enumerate(images, start=FIRST_PAGE):
-    bw = _nlbin(img)
+    bw = kraken_bin.nlbin(img)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         seg = blla.segment(bw, text_direction="horizontal-rl")
