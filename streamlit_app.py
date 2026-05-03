@@ -7,7 +7,7 @@ import zipfile
 
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 from pdf2image import convert_from_bytes
 
 DEFAULT_DPI = 400
@@ -87,6 +87,85 @@ def _binarize_page(pdf_bytes: bytes, page_num: int, dpi: int, threshold_pct: int
     bw = kraken_bin.nlbin(img, threshold=threshold_pct / 100.0)
     buf = io.BytesIO()
     bw.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
+    """Scan horizontal ink density to locate header/footer boundaries.
+
+    Returns (top_crop_px, bot_crop_px): pixels to remove from each edge.
+    Works by finding the first significant gap between the header ink-block
+    and the body, and the last such gap between the body and the footer.
+    Returns (0, 0) when no clear header/footer gap is detected.
+    """
+    img = Image.open(io.BytesIO(bw_bytes)).convert("L")
+    arr = np.array(img)
+    h, w = arr.shape
+
+    ink = (arr < 128).mean(axis=1)                    # ink fraction per row
+    smooth = np.convolve(ink, np.ones(5) / 5, mode="same")  # 5-row smoother
+
+    INK_ROW  = 0.004   # row is "inky" if > 0.4 % of width is dark
+    GAP_ROWS = 20      # gap must span ≥ 20 blank rows
+    ZONE     = h // 5  # only search in the top/bottom 20 %
+
+    def _gap_from_top(profile, end):
+        in_ink = blank = 0
+        for i in range(end):
+            if profile[i] > INK_ROW:
+                if in_ink and blank >= GAP_ROWS:
+                    return i        # first body row after the header gap
+                blank = 0
+                in_ink = 1
+            elif in_ink:
+                blank += 1
+        return 0
+
+    def _gap_from_bottom(profile, start):
+        in_ink = blank = 0
+        for i in range(h - 1, start - 1, -1):
+            if profile[i] > INK_ROW:
+                if in_ink and blank >= GAP_ROWS:
+                    return h - i - 1    # rows to remove from bottom
+                blank = 0
+                in_ink = 1
+            elif in_ink:
+                blank += 1
+        return 0
+
+    return int(_gap_from_top(smooth, ZONE)), int(_gap_from_bottom(smooth, h - ZONE))
+
+
+@st.cache_data(show_spinner=False)
+def _apply_crop(orig_bytes: bytes, top_px: int, bot_px: int, pad_px: int) -> bytes:
+    """Crop top_px / bot_px rows then add pad_px white border. Returns PNG bytes."""
+    img = Image.open(io.BytesIO(orig_bytes))
+    w, h = img.size
+    y0 = max(0, top_px)
+    y1 = max(y0 + 1, h - bot_px)
+    cropped = img.crop((0, y0, w, y1))
+    if pad_px > 0:
+        cropped = ImageOps.expand(cropped, border=pad_px, fill=(255, 255, 255))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _draw_crop_overlay(orig_bytes: bytes, top_px: int, bot_px: int) -> bytes:
+    """Draw two red crop-boundary lines on the image for the preview column."""
+    img = Image.open(io.BytesIO(orig_bytes)).convert("RGB")
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    lw    = max(4, h // 300)          # line width scales with image height
+    top_y = max(0, min(top_px, h - 1))
+    bot_y = max(top_y + 1, h - max(0, bot_px))
+    red   = (220, 30, 30)
+    for dy in range(lw):
+        draw.line([(0, top_y + dy), (w - 1, top_y + dy)], fill=red)
+        draw.line([(0, bot_y - dy), (w - 1, bot_y - dy)], fill=red)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -405,6 +484,30 @@ def _sidebar_settings() -> dict:
             ),
         )
 
+        # ── Crop margins ──────────────────────────────────────────────────
+        st.subheader("Crop margins")
+        auto_detect = st.checkbox(
+            "Auto-detect from first page",
+            value=True,
+            key="auto_detect_crop",
+            help=(
+                "Scan ink density to locate header/footer gaps on page 1. "
+                "Sliders update automatically — adjust them to fine-tune."
+            ),
+        )
+        top_crop_pct = st.slider(
+            "Top crop (%)", 0, 25, 0, step=1, key="top_crop_pct",
+            help="Percentage of page height removed from the top edge.",
+        )
+        bot_crop_pct = st.slider(
+            "Bottom crop (%)", 0, 25, 0, step=1, key="bot_crop_pct",
+            help="Percentage of page height removed from the bottom edge.",
+        )
+        pad_px = st.slider(
+            "White padding (px)", 0, 50, 20, step=2, key="crop_pad_px",
+            help="White border added around the cropped image.",
+        )
+
         # ── Active config summary ─────────────────────────────────────────
         with st.expander("Active configuration", expanded=False):
             cfg_json: dict = {"engine": engine, "dpi": dpi}
@@ -421,6 +524,12 @@ def _sidebar_settings() -> dict:
                     "temperature": temperature,
                 })
             cfg_json["apply_corrections"] = apply_corrections
+            cfg_json.update({
+                "auto_detect_crop": auto_detect,
+                "top_crop_pct": top_crop_pct,
+                "bot_crop_pct": bot_crop_pct,
+                "pad_px": pad_px,
+            })
             st.json(cfg_json)
 
     return dict(
@@ -434,12 +543,23 @@ def _sidebar_settings() -> dict:
         no_legacy_polygons=no_legacy_polygons,
         temperature=temperature,
         apply_corrections=apply_corrections,
+        auto_detect=auto_detect,
+        top_crop_pct=top_crop_pct,
+        bot_crop_pct=bot_crop_pct,
+        pad_px=pad_px,
     )
 
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
+
+    # Apply any pending auto-detect crop values BEFORE widgets render so sliders
+    # initialize to the detected percentages on the first rerun after detection.
+    for _k in ("top_crop_pct", "bot_crop_pct"):
+        _pk = f"_pending_{_k}"
+        if _pk in st.session_state:
+            st.session_state[_k] = st.session_state.pop(_pk)
 
     cfg = _sidebar_settings()
 
@@ -473,32 +593,53 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        all_bw_bytes: list[bytes] = []
+        # ── Auto-detect header/footer margins from page 1 ─────────────────
+        # Uses a file-hash-keyed session_state flag so detection only runs once
+        # per uploaded file.  Detected pixel offsets are converted to % and
+        # written to the slider keys via _pending_* so the sidebar sliders
+        # update on the forced rerun.
+        det_key = f"crop_det_{file_hash}"
+        if cfg["auto_detect"] and det_key not in st.session_state:
+            with st.spinner("Detecting header/footer margins from page 1…"):
+                bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], cfg["threshold_pct"])
+                top_px_det, bot_px_det = _detect_margins(bw_p1)
+                h_p1 = Image.open(io.BytesIO(bw_p1)).height
+            st.session_state["_pending_top_crop_pct"] = min(25, round(top_px_det / h_p1 * 100))
+            st.session_state["_pending_bot_crop_pct"] = min(25, round(bot_px_det / h_p1 * 100))
+            st.session_state[det_key] = True
+            st.rerun()
+
+        all_cropped_bytes: list[bytes] = []
         all_texts: list[str] = []
         progress = st.progress(0, text=f"Page 1 of {total}…")
 
         for page_num in range(1, total + 1):
             progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
             orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
-            bw_bytes   = _binarize_page(pdf_bytes, page_num, cfg["dpi"], cfg["threshold_pct"])
+
+            # Crop the colour render — this is the primary output for Apple Live Text.
+            h_page = Image.open(io.BytesIO(orig_bytes)).height
+            top_px = round(cfg["top_crop_pct"] / 100 * h_page)
+            bot_px = round(cfg["bot_crop_pct"] / 100 * h_page)
+            cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
 
             text, confs = "", []
             if cfg["engine"] == "claude":
                 try:
-                    text, confs = _ocr_page_claude(orig_bytes)
+                    text, confs = _ocr_page_claude(cropped_bytes)
                 except Exception as claude_exc:
                     st.warning(
                         f"Page {page_num}: Claude failed — falling back to kraken.\n"
                         f"{claude_exc}",
                         icon="⚠️",
                     )
-                    cfg["engine"] = "kraken"   # switch for remaining pages too
+                    cfg["engine"] = "kraken"
 
             if cfg["engine"] == "kraken":
                 try:
-                    _load_model()   # no-op after first load (cached)
+                    _load_model()
                     text, confs = _ocr_page(
-                        orig_bytes,
+                        cropped_bytes,
                         threshold_pct=cfg["threshold_pct"],
                         text_direction=cfg["text_direction"],
                         autocast=cfg["autocast"],
@@ -515,30 +656,30 @@ def main() -> None:
                 from confusables import apply_word_corrections
                 text = apply_word_corrections(text, include_gt_derived=True)
 
-            all_bw_bytes.append(bw_bytes)
+            all_cropped_bytes.append(cropped_bytes)
             all_texts.append(text)
 
-            orig = Image.open(io.BytesIO(orig_bytes))
-            bw   = Image.open(io.BytesIO(bw_bytes))
-
-            col_orig, col_bin = st.columns(2)
-            col_orig.image(orig, use_container_width=True,
-                           caption=f"Page {page_num} — original")
-            col_bin.image(bw, use_container_width=True,
-                          caption=f"Page {page_num} — binarized")
-            col_bin.download_button(
+            # Left: original with red crop-line overlay; right: cropped result.
+            overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
+            col_overlay, col_cropped = st.columns(2)
+            col_overlay.image(overlay_bytes, use_container_width=True,
+                              caption=f"Page {page_num} — crop preview")
+            col_cropped.image(Image.open(io.BytesIO(cropped_bytes)),
+                              use_container_width=True,
+                              caption=f"Page {page_num} — cropped")
+            col_cropped.download_button(
                 label=f"↓ Page {page_num} (PNG)",
-                data=bw_bytes,
+                data=cropped_bytes,
                 file_name=f"{stem}_page{page_num:03d}.png",
                 mime="image/png",
                 key=f"png_{file_hash}_{page_num}",
             )
 
-            # OCR text + confidence for this page
+            # OCR text + confidence (collapsed by default — image prep is primary).
             with st.expander(
                 f"OCR text — Page {page_num}"
                 + (f"  |  avg confidence {np.mean(confs):.2%}" if confs else ""),
-                expanded=True,
+                expanded=False,
             ):
                 avg_conf = np.mean(confs) if confs else None
                 if avg_conf is not None and avg_conf < 0.60:
@@ -564,7 +705,7 @@ def main() -> None:
 
         progress.empty()
 
-        if all_bw_bytes:
+        if all_cropped_bytes:
             st.markdown("**Download all pages as:**")
             col_txt, col_pdf, col_tiff, col_zip = st.columns(4)
             col_txt.download_button(
@@ -577,24 +718,24 @@ def main() -> None:
             )
             col_pdf.download_button(
                 label="PDF",
-                data=_build_pdf(tuple(all_bw_bytes), cfg["dpi"]),
-                file_name=f"{stem}_binarized.pdf",
+                data=_build_pdf(tuple(all_cropped_bytes), cfg["dpi"]),
+                file_name=f"{stem}_cropped.pdf",
                 mime="application/pdf",
                 use_container_width=True,
                 key=f"pdf_{file_hash}",
             )
             col_tiff.download_button(
                 label="Multi-page TIFF",
-                data=_build_tiff(tuple(all_bw_bytes)),
-                file_name=f"{stem}_binarized.tiff",
+                data=_build_tiff(tuple(all_cropped_bytes)),
+                file_name=f"{stem}_cropped.tiff",
                 mime="image/tiff",
                 use_container_width=True,
                 key=f"tiff_{file_hash}",
             )
             col_zip.download_button(
                 label="ZIP (PNG per page)",
-                data=_build_zip(tuple(all_bw_bytes), stem),
-                file_name=f"{stem}_binarized.zip",
+                data=_build_zip(tuple(all_cropped_bytes), stem),
+                file_name=f"{stem}_cropped.zip",
                 mime="application/zip",
                 use_container_width=True,
                 key=f"zip_{file_hash}",
