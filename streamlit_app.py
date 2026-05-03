@@ -384,107 +384,16 @@ def _sidebar_settings() -> dict:
     with st.sidebar:
         st.header("Settings")
 
-        # ── OCR Engine ────────────────────────────────────────────────────
-        st.subheader("OCR Engine")
-        engine_label = st.selectbox(
-            "Engine",
-            ["Claude Haiku (API, ~$0.004/page)", "kraken (offline, free)"],
-            index=0,
-            help=(
-                "Claude Haiku: near-perfect Arabic OCR, handles modern print and "
-                "Quranic Uthmanic script with full tashkeel. Requires "
-                "ANTHROPIC_API_KEY in Streamlit secrets.\n\n"
-                "kraken: fully offline, no API key needed. Good for modern printed "
-                "Arabic; struggles with Quranic script and decorative fonts."
-            ),
-        )
-        engine = "claude" if engine_label.startswith("Claude") else "kraken"
-
-        if engine == "claude" and not _anthropic_key():
-            st.warning(
-                "ANTHROPIC_API_KEY not set — kraken will be used as fallback. "
-                "Add the key in **Settings → Secrets** to enable Claude.",
-                icon="⚠️",
-            )
-
         # ── Image quality ────────────────────────────────────────────────
         st.subheader("Image quality")
         dpi = st.slider(
             "Rendering DPI", MIN_DPI, MAX_DPI, DEFAULT_DPI, step=50,
-            help="Higher DPI = sharper image. Affects both the preview and the image sent to the OCR engine.",
-        )
-
-        # ── kraken settings ───────────────────────────────────────────────
-        # Always rendered (widgets must exist for their values to be returned),
-        # but collapsed when Claude is the active engine.
-        kraken_section_label = (
-            "kraken settings (fallback)" if engine == "claude" else "kraken settings"
-        )
-        with st.expander(kraken_section_label, expanded=(engine == "kraken")):
-            threshold_pct = st.slider(
-                "Binarization threshold (nlbin)", 10, 90, 50, step=5,
-                help=(
-                    "nlbin ink/background threshold (0.10–0.90). "
-                    "Raise if faint strokes vanish; lower if background noise bleeds in."
-                ),
-            )
-            text_direction = st.selectbox(
-                "Text direction",
-                ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
-                index=0,
-                help=(
-                    "Primary reading direction passed to blla.segment(). "
-                    "Arabic is right-to-left (horizontal-rl)."
-                ),
-            )
-            autocast = st.checkbox(
-                "Autocast (mixed precision)",
-                value=False,
-                help="Enable torch.autocast during segmentation. Usually no effect on CPU.",
-            )
-            pad = st.slider(
-                "Line padding (px)", 0, 64, 16, step=4,
-                help=(
-                    "Blank pixels added to each line edge before recognition. "
-                    "More padding gives the LSTM context at line boundaries."
-                ),
-            )
-            bidi_label = st.selectbox(
-                "BiDi reordering",
-                list(_BIDI_OPTIONS.keys()),
-                index=0,
-                help=(
-                    "Unicode bidirectional reordering applied to each output line. "
-                    "'Auto' lets kraken detect direction per line."
-                ),
-            )
-            bidi_key = _BIDI_OPTIONS[bidi_label]
-            no_legacy_polygons = st.checkbox(
-                "Force new polygon extractor",
-                value=False,
-                help="Override polygon extractor; may hurt accuracy on older models.",
-            )
-            temperature = st.slider(
-                "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
-                help=(
-                    "Scales logits before softmax. Affects confidence scores only, "
-                    "not which characters are recognised."
-                ),
-            )
-
-        # ── Post-processing ───────────────────────────────────────────────
-        st.subheader("Post-processing")
-        apply_corrections = st.checkbox(
-            "Apply word corrections",
-            value=False,
-            help=(
-                "Run confusables.py word substitutions to fix systematic OCR errors "
-                "(tatweel stripping, فى→في, بنفه→بنفسه, etc.). "
-                "Useful with kraken; Claude usually produces these correctly already."
-            ),
+            help="Higher DPI = sharper image. 400 DPI is optimal for Apple Live Text.",
         )
 
         # ── Crop margins ──────────────────────────────────────────────────
+        # Slider keys are pre-seeded in main() before this function runs so
+        # there is never a value= / session_state conflict (Streamlit 1.57+).
         st.subheader("Crop margins")
         auto_detect = st.checkbox(
             "Auto-detect from first page",
@@ -492,49 +401,151 @@ def _sidebar_settings() -> dict:
             key="auto_detect_crop",
             help=(
                 "Scan ink density to locate header/footer gaps on page 1. "
-                "Sliders update automatically — adjust them to fine-tune."
+                "Sliders update automatically — adjust to fine-tune."
             ),
         )
         top_crop_pct = st.slider(
-            "Top crop (%)", 0, 25, 0, step=1, key="top_crop_pct",
-            help="Percentage of page height removed from the top edge.",
+            "Top crop (%)", 0, 25, step=1, key="top_crop_pct",
+            help="Percentage of page height removed from the top edge (page-number row, etc.).",
         )
         bot_crop_pct = st.slider(
-            "Bottom crop (%)", 0, 25, 0, step=1, key="bot_crop_pct",
-            help="Percentage of page height removed from the bottom edge.",
+            "Bottom crop (%)", 0, 25, step=1, key="bot_crop_pct",
+            help="Percentage of page height removed from the bottom edge (footer, running title).",
         )
         pad_px = st.slider(
-            "White padding (px)", 0, 50, 20, step=2, key="crop_pad_px",
+            "White padding (px)", 0, 50, step=2, key="crop_pad_px",
             help="White border added around the cropped image.",
         )
 
+        # ── OCR (optional) ────────────────────────────────────────────────
+        # The primary purpose of this app is to produce high-quality cropped
+        # colour images for Apple Live Text (offline, free, near-perfect Arabic).
+        # OCR via Claude Haiku or kraken is an optional extra for cases where
+        # a digital text file is also needed.
+        st.subheader("OCR (optional)")
+        run_ocr = st.checkbox(
+            "Extract text as well",
+            value=False,
+            help=(
+                "Run an OCR engine to also produce a .txt file.\n\n"
+                "The primary output is always the cropped colour images. "
+                "OCR adds processing time (and API cost for Claude)."
+            ),
+        )
+
+        # Set defaults for OCR params (used when run_ocr is False).
+        engine = "claude"
+        threshold_pct, text_direction = 50, "horizontal-rl"
+        autocast, pad = False, 16
+        bidi_key = "auto"
+        no_legacy_polygons, temperature, apply_corrections = False, 1.0, False
+
+        if run_ocr:
+            engine_label = st.selectbox(
+                "Engine",
+                ["Claude Haiku (API, ~$0.004/page)", "kraken (offline, free)"],
+                index=0,
+                help=(
+                    "Claude Haiku: near-perfect Arabic accuracy, handles Quranic "
+                    "Uthmanic script with full tashkeel. Requires ANTHROPIC_API_KEY "
+                    "in Streamlit secrets.\n\n"
+                    "kraken: fully offline, no API key. Good for modern printed "
+                    "Arabic; less reliable on Quranic script and decorative fonts."
+                ),
+            )
+            engine = "claude" if engine_label.startswith("Claude") else "kraken"
+
+            if engine == "claude" and not _anthropic_key():
+                st.warning(
+                    "ANTHROPIC_API_KEY not set — kraken will be used as fallback. "
+                    "Add the key in **Settings → Secrets** to enable Claude.",
+                    icon="⚠️",
+                )
+
+            kraken_label = (
+                "kraken settings (fallback)" if engine == "claude" else "kraken settings"
+            )
+            with st.expander(kraken_label, expanded=(engine == "kraken")):
+                threshold_pct = st.slider(
+                    "Binarization threshold (nlbin)", 10, 90, 50, step=5,
+                    help=(
+                        "nlbin threshold (0.10–0.90). "
+                        "Raise if faint strokes vanish; lower if background noise bleeds in."
+                    ),
+                )
+                text_direction = st.selectbox(
+                    "Text direction",
+                    ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
+                    index=0,
+                    help="Arabic is right-to-left (horizontal-rl).",
+                )
+                autocast = st.checkbox(
+                    "Autocast (mixed precision)", value=False,
+                    help="Enable torch.autocast during segmentation. Usually no effect on CPU.",
+                )
+                pad = st.slider(
+                    "Line padding (px)", 0, 64, 16, step=4,
+                    help="Blank pixels added to each line edge before recognition.",
+                )
+                bidi_label = st.selectbox(
+                    "BiDi reordering", list(_BIDI_OPTIONS.keys()), index=0,
+                    help="Unicode bidi reordering. 'Auto' lets kraken detect per line.",
+                )
+                bidi_key = _BIDI_OPTIONS[bidi_label]
+                no_legacy_polygons = st.checkbox(
+                    "Force new polygon extractor", value=False,
+                    help="May hurt accuracy on older models.",
+                )
+                temperature = st.slider(
+                    "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
+                    help="Affects confidence scores only, not character predictions.",
+                )
+
+            apply_corrections = st.checkbox(
+                "Apply word corrections",
+                value=False,
+                help=(
+                    "Run confusables.py substitutions to fix systematic kraken errors "
+                    "(tatweel stripping, فى→في, بنفه→بنفسه …). "
+                    "Claude usually produces these correctly already."
+                ),
+            )
+
         # ── Active config summary ─────────────────────────────────────────
         with st.expander("Active configuration", expanded=False):
-            cfg_json: dict = {"engine": engine, "dpi": dpi}
-            if engine == "claude":
-                cfg_json["model"] = "claude-haiku-4-5-20251001"
-            else:
-                cfg_json.update({
-                    "nlbin_threshold": threshold_pct / 100,
-                    "text_direction": text_direction,
-                    "autocast": autocast,
-                    "pad": pad,
-                    "bidi_reordering": _BIDI_SHORT[bidi_key],
-                    "no_legacy_polygons": no_legacy_polygons,
-                    "temperature": temperature,
-                })
-            cfg_json["apply_corrections"] = apply_corrections
-            cfg_json.update({
+            cfg_json: dict = {
+                "dpi": dpi,
                 "auto_detect_crop": auto_detect,
                 "top_crop_pct": top_crop_pct,
                 "bot_crop_pct": bot_crop_pct,
                 "pad_px": pad_px,
-            })
+                "run_ocr": run_ocr,
+            }
+            if run_ocr:
+                cfg_json["engine"] = engine
+                if engine == "claude":
+                    cfg_json["model"] = "claude-haiku-4-5-20251001"
+                else:
+                    cfg_json.update({
+                        "nlbin_threshold": threshold_pct / 100,
+                        "text_direction": text_direction,
+                        "autocast": autocast,
+                        "pad": pad,
+                        "bidi_reordering": _BIDI_SHORT[bidi_key],
+                        "no_legacy_polygons": no_legacy_polygons,
+                        "temperature": temperature,
+                    })
+                cfg_json["apply_corrections"] = apply_corrections
             st.json(cfg_json)
 
     return dict(
-        engine=engine,
         dpi=dpi,
+        auto_detect=auto_detect,
+        top_crop_pct=top_crop_pct,
+        bot_crop_pct=bot_crop_pct,
+        pad_px=pad_px,
+        run_ocr=run_ocr,
+        engine=engine,
         threshold_pct=threshold_pct,
         text_direction=text_direction,
         autocast=autocast,
@@ -543,10 +554,6 @@ def _sidebar_settings() -> dict:
         no_legacy_polygons=no_legacy_polygons,
         temperature=temperature,
         apply_corrections=apply_corrections,
-        auto_detect=auto_detect,
-        top_crop_pct=top_crop_pct,
-        bot_crop_pct=bot_crop_pct,
-        pad_px=pad_px,
     )
 
 
@@ -554,8 +561,13 @@ def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    # Apply any pending auto-detect crop values BEFORE widgets render so sliders
-    # initialize to the detected percentages on the first rerun after detection.
+    # Seed crop slider keys with defaults BEFORE _sidebar_settings() renders the
+    # widgets.  This avoids the Streamlit 1.57+ warning that fires when a slider
+    # has both key= and value= and the key is already in session_state.
+    for _k, _d in [("top_crop_pct", 0), ("bot_crop_pct", 0), ("crop_pad_px", 20)]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _d
+    # Flush any pending auto-detect values written by a previous run's st.rerun().
     for _k in ("top_crop_pct", "bot_crop_pct"):
         _pk = f"_pending_{_k}"
         if _pk in st.session_state:
@@ -563,9 +575,8 @@ def main() -> None:
 
     cfg = _sidebar_settings()
 
-    # Preload the kraken model only when it is the active engine.
-    # When Claude is selected the model loads lazily on first fallback only.
-    if cfg["engine"] == "kraken":
+    # Preload kraken model only if OCR is enabled and kraken is selected.
+    if cfg["run_ocr"] and cfg["engine"] == "kraken":
         with st.spinner("Loading Arabic OCR model…"):
             try:
                 _load_model()
@@ -578,11 +589,24 @@ def main() -> None:
     )
 
     if not uploaded_files:
-        st.info("Upload a PDF file to begin.")
+        st.info("Upload a PDF to begin.  Cropped colour images are the primary output — "
+                "enable **Extract text** in the sidebar to also run OCR.")
         return
 
     for file_obj in uploaded_files:
-        pdf_bytes = file_obj.read()
+        # Cache pdf_bytes in session_state keyed by (name, size).
+        # st.rerun() resets the UploadedFile cursor to EOF, so file_obj.read()
+        # returns b"" on every run after the first unless we cache it here.
+        pdf_cache_key = f"pdf_{file_obj.name}_{file_obj.size}"
+        if pdf_cache_key not in st.session_state:
+            raw = file_obj.read()
+            if raw:
+                st.session_state[pdf_cache_key] = raw
+        pdf_bytes = st.session_state.get(pdf_cache_key)
+        if not pdf_bytes:
+            st.error(f"Could not read '{file_obj.name}' — please re-upload the file.")
+            continue
+
         file_hash = get_file_hash(pdf_bytes)
         stem = file_obj.name.removesuffix(".pdf")
         st.header(file_obj.name)
@@ -593,20 +617,29 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # ── Auto-detect header/footer margins from page 1 ─────────────────
-        # Uses a file-hash-keyed session_state flag so detection only runs once
-        # per uploaded file.  Detected pixel offsets are converted to % and
-        # written to the slider keys via _pending_* so the sidebar sliders
-        # update on the forced rerun.
+        # ── Auto-detect header/footer margins ─────────────────────────────
+        # Runs once per file (det_key guards against infinite rerun).
+        # Detected pixel offsets are stored as _pending_* keys so the sidebar
+        # sliders pick them up BEFORE rendering on the forced rerun.
         det_key = f"crop_det_{file_hash}"
         if cfg["auto_detect"] and det_key not in st.session_state:
             with st.spinner("Detecting header/footer margins from page 1…"):
-                bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], cfg["threshold_pct"])
+                bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
                 top_px_det, bot_px_det = _detect_margins(bw_p1)
                 h_p1 = Image.open(io.BytesIO(bw_p1)).height
             st.session_state["_pending_top_crop_pct"] = min(25, round(top_px_det / h_p1 * 100))
             st.session_state["_pending_bot_crop_pct"] = min(25, round(bot_px_det / h_p1 * 100))
             st.session_state[det_key] = True
+            st.rerun()
+
+        # "Reset all pages to current global crop" clears per-page overrides.
+        if st.button(
+            f"↺ Reset all page crops to global ({cfg['top_crop_pct']}% / {cfg['bot_crop_pct']}%)",
+            key=f"reset_crop_{file_hash}",
+        ):
+            for pn in range(1, total + 1):
+                st.session_state.pop(f"p_top_{file_hash}_{pn}", None)
+                st.session_state.pop(f"p_bot_{file_hash}_{pn}", None)
             st.rerun()
 
         all_cropped_bytes: list[bytes] = []
@@ -616,50 +649,24 @@ def main() -> None:
         for page_num in range(1, total + 1):
             progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
             orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
-
-            # Crop the colour render — this is the primary output for Apple Live Text.
             h_page = Image.open(io.BytesIO(orig_bytes)).height
-            top_px = round(cfg["top_crop_pct"] / 100 * h_page)
-            bot_px = round(cfg["bot_crop_pct"] / 100 * h_page)
+
+            # Per-page crop: initialise once from the global setting, then let the
+            # user adjust independently via the per-page override expander below.
+            p_top_key = f"p_top_{file_hash}_{page_num}"
+            p_bot_key = f"p_bot_{file_hash}_{page_num}"
+            if p_top_key not in st.session_state:
+                st.session_state[p_top_key] = cfg["top_crop_pct"]
+            if p_bot_key not in st.session_state:
+                st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+            page_top = st.session_state[p_top_key]
+            page_bot = st.session_state[p_bot_key]
+
+            top_px = round(page_top / 100 * h_page)
+            bot_px = round(page_bot / 100 * h_page)
             cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
 
-            text, confs = "", []
-            if cfg["engine"] == "claude":
-                try:
-                    text, confs = _ocr_page_claude(cropped_bytes)
-                except Exception as claude_exc:
-                    st.warning(
-                        f"Page {page_num}: Claude failed — falling back to kraken.\n"
-                        f"{claude_exc}",
-                        icon="⚠️",
-                    )
-                    cfg["engine"] = "kraken"
-
-            if cfg["engine"] == "kraken":
-                try:
-                    _load_model()
-                    text, confs = _ocr_page(
-                        cropped_bytes,
-                        threshold_pct=cfg["threshold_pct"],
-                        text_direction=cfg["text_direction"],
-                        autocast=cfg["autocast"],
-                        pad=cfg["pad"],
-                        bidi_key=cfg["bidi_key"],
-                        no_legacy_polygons=cfg["no_legacy_polygons"],
-                        temperature=cfg["temperature"],
-                    )
-                except Exception as exc:
-                    st.error(f"Page {page_num}: OCR failed — {exc}")
-                    text, confs = "", []
-
-            if cfg["apply_corrections"] and text:
-                from confusables import apply_word_corrections
-                text = apply_word_corrections(text, include_gt_derived=True)
-
-            all_cropped_bytes.append(cropped_bytes)
-            all_texts.append(text)
-
-            # Left: original with red crop-line overlay; right: cropped result.
+            # Left: full page with red crop-line overlay; right: cropped result.
             overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
             col_overlay, col_cropped = st.columns(2)
             col_overlay.image(overlay_bytes, use_container_width=True,
@@ -675,48 +682,91 @@ def main() -> None:
                 key=f"png_{file_hash}_{page_num}",
             )
 
-            # OCR text + confidence (collapsed by default — image prep is primary).
+            # Per-page crop override — collapsed by default.
+            # Changing these sliders triggers a rerun; the new values are read
+            # from session_state at the top of this loop on the next run.
             with st.expander(
-                f"OCR text — Page {page_num}"
-                + (f"  |  avg confidence {np.mean(confs):.2%}" if confs else ""),
+                f"Adjust crop — page {page_num}  "
+                f"(top {page_top}% / bottom {page_bot}%)",
                 expanded=False,
             ):
-                avg_conf = np.mean(confs) if confs else None
-                if avg_conf is not None and avg_conf < 0.60:
-                    st.warning(
-                        f"Low average confidence ({avg_conf:.1%}). "
-                        "Try adjusting DPI, threshold, or padding."
-                    )
-                engine_name = (
-                    "Claude Haiku" if cfg["engine"] == "claude" else "kraken"
+                st.caption(
+                    f"Global: top {cfg['top_crop_pct']}% / bottom {cfg['bot_crop_pct']}%  "
+                    "— adjust below to override for this page only."
                 )
-                st.text_area(
-                    label="",
-                    value=text,
-                    height=220,
-                    key=f"ocr_text_{file_hash}_{page_num}",
-                    help=f"Arabic text extracted by {engine_name}.",
-                )
-                if confs:
-                    st.caption(
-                        f"{len(confs)} lines recognised — "
-                        f"min {min(confs):.1%} / mean {avg_conf:.1%} / max {max(confs):.1%}"
+                st.slider(f"Top (%) — page {page_num}", 0, 25, step=1, key=p_top_key)
+                st.slider(f"Bottom (%) — page {page_num}", 0, 25, step=1, key=p_bot_key)
+
+            # ── OCR (optional) ────────────────────────────────────────────
+            text, confs = "", []
+            if cfg["run_ocr"]:
+                if cfg["engine"] == "claude":
+                    try:
+                        text, confs = _ocr_page_claude(cropped_bytes)
+                    except Exception as claude_exc:
+                        st.warning(
+                            f"Page {page_num}: Claude failed — falling back to kraken.\n"
+                            f"{claude_exc}",
+                            icon="⚠️",
+                        )
+                        cfg["engine"] = "kraken"
+
+                if cfg["engine"] == "kraken":
+                    try:
+                        _load_model()
+                        text, confs = _ocr_page(
+                            cropped_bytes,
+                            threshold_pct=cfg["threshold_pct"],
+                            text_direction=cfg["text_direction"],
+                            autocast=cfg["autocast"],
+                            pad=cfg["pad"],
+                            bidi_key=cfg["bidi_key"],
+                            no_legacy_polygons=cfg["no_legacy_polygons"],
+                            temperature=cfg["temperature"],
+                        )
+                    except Exception as exc:
+                        st.error(f"Page {page_num}: OCR failed — {exc}")
+
+                if cfg["apply_corrections"] and text:
+                    from confusables import apply_word_corrections
+                    text = apply_word_corrections(text, include_gt_derived=True)
+
+                with st.expander(
+                    f"OCR text — Page {page_num}"
+                    + (f"  |  avg confidence {np.mean(confs):.2%}" if confs else ""),
+                    expanded=False,
+                ):
+                    avg_conf = np.mean(confs) if confs else None
+                    if avg_conf is not None and avg_conf < 0.60:
+                        st.warning(
+                            f"Low average confidence ({avg_conf:.1%}). "
+                            "Try adjusting DPI, threshold, or padding."
+                        )
+                    engine_name = "Claude Haiku" if cfg["engine"] == "claude" else "kraken"
+                    st.text_area(
+                        label="Extracted text",
+                        label_visibility="collapsed",
+                        value=text,
+                        height=220,
+                        key=f"ocr_text_{file_hash}_{page_num}",
+                        help=f"Arabic text extracted by {engine_name}.",
                     )
+                    if confs:
+                        st.caption(
+                            f"{len(confs)} lines — "
+                            f"min {min(confs):.1%} / mean {avg_conf:.1%} / max {max(confs):.1%}"
+                        )
+
+            all_cropped_bytes.append(cropped_bytes)
+            all_texts.append(text)
 
         progress.empty()
 
         if all_cropped_bytes:
             st.markdown("**Download all pages as:**")
-            col_txt, col_pdf, col_tiff, col_zip = st.columns(4)
-            col_txt.download_button(
-                label="TXT",
-                data=_build_txt(tuple(all_texts), stem),
-                file_name=f"{stem}.txt",
-                mime="text/plain; charset=utf-8",
-                use_container_width=True,
-                key=f"txt_{file_hash}",
-            )
-            col_pdf.download_button(
+            n_cols = 4 if cfg["run_ocr"] else 3
+            cols = st.columns(n_cols)
+            cols[0].download_button(
                 label="PDF",
                 data=_build_pdf(tuple(all_cropped_bytes), cfg["dpi"]),
                 file_name=f"{stem}_cropped.pdf",
@@ -724,7 +774,7 @@ def main() -> None:
                 use_container_width=True,
                 key=f"pdf_{file_hash}",
             )
-            col_tiff.download_button(
+            cols[1].download_button(
                 label="Multi-page TIFF",
                 data=_build_tiff(tuple(all_cropped_bytes)),
                 file_name=f"{stem}_cropped.tiff",
@@ -732,7 +782,7 @@ def main() -> None:
                 use_container_width=True,
                 key=f"tiff_{file_hash}",
             )
-            col_zip.download_button(
+            cols[2].download_button(
                 label="ZIP (PNG per page)",
                 data=_build_zip(tuple(all_cropped_bytes), stem),
                 file_name=f"{stem}_cropped.zip",
@@ -740,6 +790,15 @@ def main() -> None:
                 use_container_width=True,
                 key=f"zip_{file_hash}",
             )
+            if cfg["run_ocr"]:
+                cols[3].download_button(
+                    label="TXT",
+                    data=_build_txt(tuple(all_texts), stem),
+                    file_name=f"{stem}.txt",
+                    mime="text/plain; charset=utf-8",
+                    use_container_width=True,
+                    key=f"txt_{file_hash}",
+                )
 
         st.divider()
 
