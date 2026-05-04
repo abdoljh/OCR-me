@@ -405,11 +405,11 @@ def _sidebar_settings() -> dict:
             ),
         )
         top_crop_pct = st.slider(
-            "Top crop (%)", 0, 25, step=1, key="top_crop_pct",
+            "Top crop (%)", 0, 50, step=1, key="top_crop_pct",
             help="Percentage of page height removed from the top edge (page-number row, etc.).",
         )
         bot_crop_pct = st.slider(
-            "Bottom crop (%)", 0, 25, step=1, key="bot_crop_pct",
+            "Bottom crop (%)", 0, 50, step=1, key="bot_crop_pct",
             help="Percentage of page height removed from the bottom edge (footer, running title).",
         )
         pad_px = st.slider(
@@ -561,13 +561,11 @@ def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
     st.title("Arabic PDF OCR")
 
-    # Seed crop slider keys with defaults BEFORE _sidebar_settings() renders the
-    # widgets.  This avoids the Streamlit 1.57+ warning that fires when a slider
-    # has both key= and value= and the key is already in session_state.
+    # Seed crop slider keys with defaults BEFORE _sidebar_settings() renders widgets.
     for _k, _d in [("top_crop_pct", 0), ("bot_crop_pct", 0), ("crop_pad_px", 20)]:
         if _k not in st.session_state:
             st.session_state[_k] = _d
-    # Flush any pending auto-detect values written by a previous run's st.rerun().
+    # Flush pending auto-detect values from a previous st.rerun().
     for _k in ("top_crop_pct", "bot_crop_pct"):
         _pk = f"_pending_{_k}"
         if _pk in st.session_state:
@@ -575,28 +573,19 @@ def main() -> None:
 
     cfg = _sidebar_settings()
 
-    # Preload kraken model only if OCR is enabled and kraken is selected.
-    if cfg["run_ocr"] and cfg["engine"] == "kraken":
-        with st.spinner("Loading Arabic OCR model…"):
-            try:
-                _load_model()
-            except Exception as exc:
-                st.error(f"Could not load OCR model: {exc}")
-                return
-
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)", type=["pdf"], accept_multiple_files=True,
     )
-
     if not uploaded_files:
-        st.info("Upload a PDF to begin.  Cropped colour images are the primary output — "
-                "enable **Extract text** in the sidebar to also run OCR.")
+        st.info(
+            "Upload a PDF to begin.  "
+            "Adjust the **Crop margins** sliders in the sidebar, then step through "
+            "each page to fine-tune the crop before downloading."
+        )
         return
 
     for file_obj in uploaded_files:
-        # Cache pdf_bytes in session_state keyed by (name, size).
-        # st.rerun() resets the UploadedFile cursor to EOF, so file_obj.read()
-        # returns b"" on every run after the first unless we cache it here.
+        # Cache raw bytes — st.rerun() moves the UploadedFile cursor to EOF.
         pdf_cache_key = f"pdf_{file_obj.name}_{file_obj.size}"
         if pdf_cache_key not in st.session_state:
             raw = file_obj.read()
@@ -604,7 +593,7 @@ def main() -> None:
                 st.session_state[pdf_cache_key] = raw
         pdf_bytes = st.session_state.get(pdf_cache_key)
         if not pdf_bytes:
-            st.error(f"Could not read '{file_obj.name}' — please re-upload the file.")
+            st.error(f"Could not read '{file_obj.name}' — please re-upload.")
             continue
 
         file_hash = get_file_hash(pdf_bytes)
@@ -617,173 +606,105 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # ── Auto-detect header/footer margins ─────────────────────────────
-        # Runs once per file (det_key guards against infinite rerun).
-        # Detected pixel offsets are stored as _pending_* keys so the sidebar
-        # sliders pick them up BEFORE rendering on the forced rerun.
+        # ── Auto-detect margins (once per file) ───────────────────────────
         det_key = f"crop_det_{file_hash}"
         if cfg["auto_detect"] and det_key not in st.session_state:
             with st.spinner("Detecting header/footer margins from page 1…"):
                 bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
                 top_px_det, bot_px_det = _detect_margins(bw_p1)
                 h_p1 = Image.open(io.BytesIO(bw_p1)).height
-            st.session_state["_pending_top_crop_pct"] = min(25, round(top_px_det / h_p1 * 100))
-            st.session_state["_pending_bot_crop_pct"] = min(25, round(bot_px_det / h_p1 * 100))
+            st.session_state["_pending_top_crop_pct"] = min(50, round(top_px_det / h_p1 * 100))
+            st.session_state["_pending_bot_crop_pct"] = min(50, round(bot_px_det / h_p1 * 100))
             st.session_state[det_key] = True
             st.rerun()
 
-        # "Reset all pages to current global crop" clears per-page overrides.
-        if st.button(
-            f"↺ Reset all page crops to global ({cfg['top_crop_pct']}% / {cfg['bot_crop_pct']}%)",
-            key=f"reset_crop_{file_hash}",
-        ):
+        # Wizard state ─────────────────────────────────────────────────────
+        wiz_page_key = f"wiz_page_{file_hash}"
+        wiz_done_key = f"wiz_done_{file_hash}"
+        if wiz_page_key not in st.session_state:
+            st.session_state[wiz_page_key] = 1
+
+        # ══════════════════════════════════════════════════════════════════
+        # DOWNLOAD VIEW — all pages cropped, optional OCR, download buttons.
+        # ══════════════════════════════════════════════════════════════════
+        if st.session_state.get(wiz_done_key, False):
+            all_cropped_bytes: list[bytes] = []
+            all_texts: list[str] = []
+
+            prog = st.progress(0, text="Building images…")
             for pn in range(1, total + 1):
-                st.session_state.pop(f"p_top_{file_hash}_{pn}", None)
-                st.session_state.pop(f"p_bot_{file_hash}_{pn}", None)
-            st.rerun()
+                prog.progress(pn / total, text=f"Page {pn} of {total}…")
+                ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
+                h  = Image.open(io.BytesIO(ob)).height
+                pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
+                pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
+                cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h), cfg["pad_px"])
+                all_cropped_bytes.append(cb)
 
-        all_cropped_bytes: list[bytes] = []
-        all_texts: list[str] = []
-        progress = st.progress(0, text=f"Page 1 of {total}…")
+                text, confs = "", []
+                if cfg["run_ocr"]:
+                    if cfg["engine"] == "claude":
+                        try:
+                            text, confs = _ocr_page_claude(cb)
+                        except Exception:
+                            cfg["engine"] = "kraken"
+                    if cfg["engine"] == "kraken":
+                        try:
+                            _load_model()
+                            text, confs = _ocr_page(
+                                cb,
+                                threshold_pct=cfg["threshold_pct"],
+                                text_direction=cfg["text_direction"],
+                                autocast=cfg["autocast"],
+                                pad=cfg["pad"],
+                                bidi_key=cfg["bidi_key"],
+                                no_legacy_polygons=cfg["no_legacy_polygons"],
+                                temperature=cfg["temperature"],
+                            )
+                        except Exception:
+                            pass
+                    if cfg["apply_corrections"] and text:
+                        from confusables import apply_word_corrections
+                        text = apply_word_corrections(text, include_gt_derived=True)
+                all_texts.append(text)
+            prog.empty()
 
-        for page_num in range(1, total + 1):
-            progress.progress(page_num / total, text=f"Page {page_num} of {total}…")
-            orig_bytes = _render_page_bytes(pdf_bytes, page_num, cfg["dpi"])
-            h_page = Image.open(io.BytesIO(orig_bytes)).height
-
-            # Per-page crop: initialise once from the global setting, then let the
-            # user adjust independently via the per-page override expander below.
-            p_top_key = f"p_top_{file_hash}_{page_num}"
-            p_bot_key = f"p_bot_{file_hash}_{page_num}"
-            if p_top_key not in st.session_state:
-                st.session_state[p_top_key] = cfg["top_crop_pct"]
-            if p_bot_key not in st.session_state:
-                st.session_state[p_bot_key] = cfg["bot_crop_pct"]
-            page_top = st.session_state[p_top_key]
-            page_bot = st.session_state[p_bot_key]
-
-            top_px = round(page_top / 100 * h_page)
-            bot_px = round(page_bot / 100 * h_page)
-            cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
-
-            # Left: full page with red crop-line overlay; right: cropped result.
-            overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
-            col_overlay, col_cropped = st.columns(2)
-            col_overlay.image(overlay_bytes, use_container_width=True,
-                              caption=f"Page {page_num} — crop preview")
-            col_cropped.image(Image.open(io.BytesIO(cropped_bytes)),
-                              use_container_width=True,
-                              caption=f"Page {page_num} — cropped")
-            col_cropped.download_button(
-                label=f"↓ Page {page_num} (PNG)",
-                data=cropped_bytes,
-                file_name=f"{stem}_page{page_num:03d}.png",
-                mime="image/png",
-                key=f"png_{file_hash}_{page_num}",
-            )
-
-            # Per-page crop override — collapsed by default.
-            # Changing these sliders triggers a rerun; the new values are read
-            # from session_state at the top of this loop on the next run.
-            with st.expander(
-                f"Adjust crop — page {page_num}  "
-                f"(top {page_top}% / bottom {page_bot}%)",
-                expanded=False,
-            ):
-                st.caption(
-                    f"Global: top {cfg['top_crop_pct']}% / bottom {cfg['bot_crop_pct']}%  "
-                    "— adjust below to override for this page only."
-                )
-                st.slider(f"Top (%) — page {page_num}", 0, 25, step=1, key=p_top_key)
-                st.slider(f"Bottom (%) — page {page_num}", 0, 25, step=1, key=p_bot_key)
-
-            # ── OCR (optional) ────────────────────────────────────────────
-            text, confs = "", []
-            if cfg["run_ocr"]:
-                if cfg["engine"] == "claude":
-                    try:
-                        text, confs = _ocr_page_claude(cropped_bytes)
-                    except Exception as claude_exc:
-                        st.warning(
-                            f"Page {page_num}: Claude failed — falling back to kraken.\n"
-                            f"{claude_exc}",
-                            icon="⚠️",
-                        )
-                        cfg["engine"] = "kraken"
-
-                if cfg["engine"] == "kraken":
-                    try:
-                        _load_model()
-                        text, confs = _ocr_page(
-                            cropped_bytes,
-                            threshold_pct=cfg["threshold_pct"],
-                            text_direction=cfg["text_direction"],
-                            autocast=cfg["autocast"],
-                            pad=cfg["pad"],
-                            bidi_key=cfg["bidi_key"],
-                            no_legacy_polygons=cfg["no_legacy_polygons"],
-                            temperature=cfg["temperature"],
-                        )
-                    except Exception as exc:
-                        st.error(f"Page {page_num}: OCR failed — {exc}")
-
-                if cfg["apply_corrections"] and text:
-                    from confusables import apply_word_corrections
-                    text = apply_word_corrections(text, include_gt_derived=True)
-
-                with st.expander(
-                    f"OCR text — Page {page_num}"
-                    + (f"  |  avg confidence {np.mean(confs):.2%}" if confs else ""),
-                    expanded=False,
-                ):
-                    avg_conf = np.mean(confs) if confs else None
-                    if avg_conf is not None and avg_conf < 0.60:
-                        st.warning(
-                            f"Low average confidence ({avg_conf:.1%}). "
-                            "Try adjusting DPI, threshold, or padding."
-                        )
-                    engine_name = "Claude Haiku" if cfg["engine"] == "claude" else "kraken"
-                    st.text_area(
-                        label="Extracted text",
-                        label_visibility="collapsed",
-                        value=text,
-                        height=220,
-                        key=f"ocr_text_{file_hash}_{page_num}",
-                        help=f"Arabic text extracted by {engine_name}.",
+            # Thumbnail grid (up to 5 per row).
+            THUMB_COLS = 5
+            for row_start in range(0, total, THUMB_COLS):
+                row_pages = range(row_start + 1, min(row_start + THUMB_COLS + 1, total + 1))
+                thumb_row = st.columns(len(row_pages))
+                for i, pn in enumerate(row_pages):
+                    pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
+                    pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
+                    thumb_row[i].image(
+                        Image.open(io.BytesIO(all_cropped_bytes[pn - 1])),
+                        use_container_width=True,
+                        caption=f"p.{pn}  ↑{pt}% ↓{pb}%",
                     )
-                    if confs:
-                        st.caption(
-                            f"{len(confs)} lines — "
-                            f"min {min(confs):.1%} / mean {avg_conf:.1%} / max {max(confs):.1%}"
-                        )
 
-            all_cropped_bytes.append(cropped_bytes)
-            all_texts.append(text)
-
-        progress.empty()
-
-        if all_cropped_bytes:
+            # Download buttons.
             st.markdown("**Download all pages as:**")
             n_cols = 4 if cfg["run_ocr"] else 3
-            cols = st.columns(n_cols)
-            cols[0].download_button(
-                label="PDF",
+            dl_cols = st.columns(n_cols)
+            dl_cols[0].download_button(
+                "PDF",
                 data=_build_pdf(tuple(all_cropped_bytes), cfg["dpi"]),
                 file_name=f"{stem}_cropped.pdf",
                 mime="application/pdf",
                 use_container_width=True,
                 key=f"pdf_{file_hash}",
             )
-            cols[1].download_button(
-                label="Multi-page TIFF",
+            dl_cols[1].download_button(
+                "Multi-page TIFF",
                 data=_build_tiff(tuple(all_cropped_bytes)),
                 file_name=f"{stem}_cropped.tiff",
                 mime="image/tiff",
                 use_container_width=True,
                 key=f"tiff_{file_hash}",
             )
-            cols[2].download_button(
-                label="ZIP (PNG per page)",
+            dl_cols[2].download_button(
+                "ZIP (PNG per page)",
                 data=_build_zip(tuple(all_cropped_bytes), stem),
                 file_name=f"{stem}_cropped.zip",
                 mime="application/zip",
@@ -791,8 +712,8 @@ def main() -> None:
                 key=f"zip_{file_hash}",
             )
             if cfg["run_ocr"]:
-                cols[3].download_button(
-                    label="TXT",
+                dl_cols[3].download_button(
+                    "TXT",
                     data=_build_txt(tuple(all_texts), stem),
                     file_name=f"{stem}.txt",
                     mime="text/plain; charset=utf-8",
@@ -800,7 +721,95 @@ def main() -> None:
                     key=f"txt_{file_hash}",
                 )
 
-        st.divider()
+            st.divider()
+            if st.button("← Back to page editor", key=f"back_{file_hash}"):
+                st.session_state[wiz_done_key] = False
+                st.rerun()
+
+        # ══════════════════════════════════════════════════════════════════
+        # WIZARD VIEW — one page at a time with crop sliders and navigation.
+        # ══════════════════════════════════════════════════════════════════
+        else:
+            current = st.session_state[wiz_page_key]
+
+            # Per-page crop keys — initialise from global setting on first visit.
+            p_top_key = f"p_top_{file_hash}_{current}"
+            p_bot_key = f"p_bot_{file_hash}_{current}"
+            if p_top_key not in st.session_state:
+                st.session_state[p_top_key] = cfg["top_crop_pct"]
+            if p_bot_key not in st.session_state:
+                st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+
+            # Crop sliders — placed ABOVE the preview so the user sets values
+            # before reading the result.
+            st.caption(f"**Page {current} of {total}**")
+            sl_left, sl_right = st.columns(2)
+            sl_left.slider(
+                f"Top crop (%) — page {current}", 0, 50, step=1,
+                key=p_top_key,
+                help="Rows to remove from the top of this page.",
+            )
+            sl_right.slider(
+                f"Bottom crop (%) — page {current}", 0, 50, step=1,
+                key=p_bot_key,
+                help="Rows to remove from the bottom of this page.",
+            )
+
+            # Compute crop from the (possibly just-updated) slider values.
+            orig_bytes = _render_page_bytes(pdf_bytes, current, cfg["dpi"])
+            h_page   = Image.open(io.BytesIO(orig_bytes)).height
+            page_top = st.session_state[p_top_key]
+            page_bot = st.session_state[p_bot_key]
+            top_px   = round(page_top / 100 * h_page)
+            bot_px   = round(page_bot / 100 * h_page)
+            cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
+
+            # Preview: overlay left, cropped result right.
+            overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
+            col_left, col_right = st.columns(2)
+            col_left.image(overlay_bytes, use_container_width=True,
+                           caption=f"Page {current} — crop lines")
+            col_right.image(Image.open(io.BytesIO(cropped_bytes)),
+                            use_container_width=True,
+                            caption=f"Page {current} — result")
+            col_right.download_button(
+                f"↓ Page {current} (PNG)",
+                data=cropped_bytes,
+                file_name=f"{stem}_page{current:03d}.png",
+                mime="image/png",
+                key=f"png_{file_hash}_{current}",
+            )
+
+            # Navigation row.
+            st.write("")
+            nav_prev, nav_mid, nav_next = st.columns([1, 2, 1])
+            with nav_prev:
+                if st.button("← Prev", disabled=(current == 1),
+                             key=f"prev_{file_hash}", use_container_width=True):
+                    st.session_state[wiz_page_key] = current - 1
+                    st.rerun()
+            with nav_mid:
+                if st.button(
+                    "⬇ Proceed to downloads",
+                    key=f"skip_{file_hash}",
+                    use_container_width=True,
+                    help="Use current crop settings for any un-visited pages and go to downloads.",
+                ):
+                    st.session_state[wiz_done_key] = True
+                    st.rerun()
+            with nav_next:
+                label = "Next →" if current < total else "✓ Done"
+                btn_type = "secondary" if current < total else "primary"
+                if st.button(label, key=f"next_{file_hash}",
+                             use_container_width=True, type=btn_type):
+                    if current < total:
+                        st.session_state[wiz_page_key] = current + 1
+                        st.rerun()
+                    else:
+                        st.session_state[wiz_done_key] = True
+                        st.rerun()
+
+            st.divider()
 
 
 if __name__ == "__main__":
