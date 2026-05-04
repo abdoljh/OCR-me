@@ -1,6 +1,8 @@
 import io
 import hashlib
 import os
+import shutil
+import tempfile
 import urllib.request
 import warnings
 import zipfile
@@ -354,12 +356,12 @@ def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def _build_pdf(png_bytes_list: tuple[bytes, ...], dpi: int) -> bytes:
+def _build_pdf(png_paths: tuple[str, ...], dpi: int) -> bytes:
     # Grayscale + half-size: reduces peak RAM ~12× vs full-colour originals.
     # At 400 DPI source, the PDF is effectively 200 DPI — adequate for reading.
     images = []
-    for b in png_bytes_list:
-        img = Image.open(io.BytesIO(b)).convert("L")
+    for path in png_paths:
+        img = Image.open(path).convert("L")
         w, h = img.size
         images.append(img.resize((w // 2, h // 2), Image.LANCZOS))
     buf = io.BytesIO()
@@ -369,10 +371,10 @@ def _build_pdf(png_bytes_list: tuple[bytes, ...], dpi: int) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def _build_tiff(png_bytes_list: tuple[bytes, ...]) -> bytes:
+def _build_tiff(png_paths: tuple[str, ...]) -> bytes:
     images = []
-    for b in png_bytes_list:
-        img = Image.open(io.BytesIO(b)).convert("L")
+    for path in png_paths:
+        img = Image.open(path).convert("L")
         w, h = img.size
         images.append(img.resize((w // 2, h // 2), Image.LANCZOS))
     buf = io.BytesIO()
@@ -382,11 +384,12 @@ def _build_tiff(png_bytes_list: tuple[bytes, ...]) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def _build_zip(png_bytes_list: tuple[bytes, ...], stem: str) -> bytes:
+def _build_zip(png_paths: tuple[str, ...], stem: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, png_bytes in enumerate(png_bytes_list, 1):
-            zf.writestr(f"{stem}_page{i:03d}.png", png_bytes)
+        for i, path in enumerate(png_paths, 1):
+            with open(path, "rb") as f:
+                zf.writestr(f"{stem}_page{i:03d}.png", f.read())
     return buf.getvalue()
 
 
@@ -639,12 +642,18 @@ def main() -> None:
         # DOWNLOAD VIEW — all pages cropped, optional OCR, download buttons.
         # ══════════════════════════════════════════════════════════════════
         if st.session_state.get(wiz_done_key, False):
-            all_cropped_bytes: list[bytes] = []
+            # Each cropped page is written to a temp file immediately after
+            # cropping so the download data is always the exact cropped PNG,
+            # not whatever @st.cache_data happens to return on a rerun.
+            # The tmpdir is kept in session_state so it survives reruns.
+            tmpdir_key = f"tmpdir_{file_hash}"
+            if tmpdir_key not in st.session_state:
+                st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
+            tmpdir = st.session_state[tmpdir_key]
+
             all_texts: list[str] = []
 
-            # Pre-allocate the full thumbnail grid before the processing loop so
-            # each thumbnail appears immediately as its page is rendered, rather
-            # than all appearing at once after the loop finishes.
+            # Pre-allocate thumbnail grid (fills incrementally during the loop).
             THUMB_COLS = 5
             thumb_cols: list[list] = []
             for row_start in range(0, total, THUMB_COLS):
@@ -652,14 +661,27 @@ def main() -> None:
                 thumb_cols.append(list(st.columns(n_in_row)))
 
             prog = st.progress(0, text="Building images…")
+            png_paths: list[str] = []
+
             for pn in range(1, total + 1):
                 prog.progress(pn / total, text=f"Page {pn} of {total}…")
-                ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
-                h  = Image.open(io.BytesIO(ob)).height
+                png_path = os.path.join(tmpdir, f"page{pn:03d}.png")
+                png_paths.append(png_path)
+
                 pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
                 pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
-                cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h), cfg["pad_px"])
-                all_cropped_bytes.append(cb)
+
+                # Write the cropped PNG once; reuse on subsequent reruns.
+                if not os.path.exists(png_path):
+                    ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
+                    h  = Image.open(io.BytesIO(ob)).height
+                    cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h),
+                                     cfg["pad_px"])
+                    with open(png_path, "wb") as fh:
+                        fh.write(cb)
+
+                with open(png_path, "rb") as fh:
+                    cb = fh.read()
 
                 # Fill thumbnail cell immediately (incremental display).
                 col = thumb_cols[(pn - 1) // THUMB_COLS][(pn - 1) % THUMB_COLS]
@@ -701,13 +723,13 @@ def main() -> None:
                 all_texts.append(text)
             prog.empty()
 
-            # Bulk download buttons (appear after all pages are ready).
+            # Bulk download buttons — builders read from temp files.
             st.markdown("**Download all pages as:**")
             n_cols = 4 if cfg["run_ocr"] else 3
             dl_cols = st.columns(n_cols)
             dl_cols[0].download_button(
                 "PDF",
-                data=_build_pdf(tuple(all_cropped_bytes), cfg["dpi"]),
+                data=_build_pdf(tuple(png_paths), cfg["dpi"]),
                 file_name=f"{stem}_cropped.pdf",
                 mime="application/pdf",
                 use_container_width=True,
@@ -715,7 +737,7 @@ def main() -> None:
             )
             dl_cols[1].download_button(
                 "Multi-page TIFF",
-                data=_build_tiff(tuple(all_cropped_bytes)),
+                data=_build_tiff(tuple(png_paths)),
                 file_name=f"{stem}_cropped.tiff",
                 mime="image/tiff",
                 use_container_width=True,
@@ -723,7 +745,7 @@ def main() -> None:
             )
             dl_cols[2].download_button(
                 "ZIP (PNG per page)",
-                data=_build_zip(tuple(all_cropped_bytes), stem),
+                data=_build_zip(tuple(png_paths), stem),
                 file_name=f"{stem}_cropped.zip",
                 mime="application/zip",
                 use_container_width=True,
@@ -741,6 +763,9 @@ def main() -> None:
 
             st.divider()
             if st.button("← Back to page editor", key=f"back_{file_hash}"):
+                # Remove temp files so fresh crops are applied next time.
+                if tmpdir_key in st.session_state:
+                    shutil.rmtree(st.session_state.pop(tmpdir_key), ignore_errors=True)
                 st.session_state[wiz_done_key] = False
                 st.rerun()
 
