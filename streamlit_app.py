@@ -355,15 +355,26 @@ def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def _build_pdf(png_bytes_list: tuple[bytes, ...], dpi: int) -> bytes:
-    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
+    # Grayscale + half-size: reduces peak RAM ~12× vs full-colour originals.
+    # At 400 DPI source, the PDF is effectively 200 DPI — adequate for reading.
+    images = []
+    for b in png_bytes_list:
+        img = Image.open(io.BytesIO(b)).convert("L")
+        w, h = img.size
+        images.append(img.resize((w // 2, h // 2), Image.LANCZOS))
     buf = io.BytesIO()
-    images[0].save(buf, format="PDF", save_all=True, append_images=images[1:], resolution=dpi)
+    images[0].save(buf, format="PDF", save_all=True, append_images=images[1:],
+                   resolution=dpi // 2)
     return buf.getvalue()
 
 
 @st.cache_data(show_spinner=False)
 def _build_tiff(png_bytes_list: tuple[bytes, ...]) -> bytes:
-    images = [Image.open(io.BytesIO(b)) for b in png_bytes_list]
+    images = []
+    for b in png_bytes_list:
+        img = Image.open(io.BytesIO(b)).convert("L")
+        w, h = img.size
+        images.append(img.resize((w // 2, h // 2), Image.LANCZOS))
     buf = io.BytesIO()
     images[0].save(buf, format="TIFF", save_all=True, append_images=images[1:],
                    compression="tiff_deflate")
@@ -631,6 +642,15 @@ def main() -> None:
             all_cropped_bytes: list[bytes] = []
             all_texts: list[str] = []
 
+            # Pre-allocate the full thumbnail grid before the processing loop so
+            # each thumbnail appears immediately as its page is rendered, rather
+            # than all appearing at once after the loop finishes.
+            THUMB_COLS = 5
+            thumb_cols: list[list] = []
+            for row_start in range(0, total, THUMB_COLS):
+                n_in_row = min(THUMB_COLS, total - row_start)
+                thumb_cols.append(list(st.columns(n_in_row)))
+
             prog = st.progress(0, text="Building images…")
             for pn in range(1, total + 1):
                 prog.progress(pn / total, text=f"Page {pn} of {total}…")
@@ -640,6 +660,18 @@ def main() -> None:
                 pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
                 cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h), cfg["pad_px"])
                 all_cropped_bytes.append(cb)
+
+                # Fill thumbnail cell immediately (incremental display).
+                col = thumb_cols[(pn - 1) // THUMB_COLS][(pn - 1) % THUMB_COLS]
+                col.image(Image.open(io.BytesIO(cb)), width="stretch",
+                          caption=f"p.{pn}  ↑{pt}% ↓{pb}%")
+                col.download_button(
+                    f"↓ p.{pn}",
+                    data=cb,
+                    file_name=f"{stem}_page{pn:03d}.png",
+                    mime="image/png",
+                    key=f"dl_thumb_{file_hash}_{pn}",
+                )
 
                 text, confs = "", []
                 if cfg["run_ocr"]:
@@ -669,21 +701,7 @@ def main() -> None:
                 all_texts.append(text)
             prog.empty()
 
-            # Thumbnail grid (up to 5 per row).
-            THUMB_COLS = 5
-            for row_start in range(0, total, THUMB_COLS):
-                row_pages = range(row_start + 1, min(row_start + THUMB_COLS + 1, total + 1))
-                thumb_row = st.columns(len(row_pages))
-                for i, pn in enumerate(row_pages):
-                    pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
-                    pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
-                    thumb_row[i].image(
-                        Image.open(io.BytesIO(all_cropped_bytes[pn - 1])),
-                        use_container_width=True,
-                        caption=f"p.{pn}  ↑{pt}% ↓{pb}%",
-                    )
-
-            # Download buttons.
+            # Bulk download buttons (appear after all pages are ready).
             st.markdown("**Download all pages as:**")
             n_cols = 4 if cfg["run_ocr"] else 3
             dl_cols = st.columns(n_cols)
@@ -767,10 +785,10 @@ def main() -> None:
             # Preview: overlay left, cropped result right.
             overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
             col_left, col_right = st.columns(2)
-            col_left.image(overlay_bytes, use_container_width=True,
+            col_left.image(overlay_bytes, width="stretch",
                            caption=f"Page {current} — crop lines")
             col_right.image(Image.open(io.BytesIO(cropped_bytes)),
-                            use_container_width=True,
+                            width="stretch",
                             caption=f"Page {current} — result")
             col_right.download_button(
                 f"↓ Page {current} (PNG)",
