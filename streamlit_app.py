@@ -109,7 +109,7 @@ def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
     smooth = np.convolve(ink, np.ones(5) / 5, mode="same")  # 5-row smoother
 
     INK_ROW  = 0.004   # row is "inky" if > 0.4 % of width is dark
-    GAP_ROWS = 20      # gap must span ≥ 20 blank rows
+    GAP_ROWS = 20      # gap must span >= 20 blank rows
     ZONE     = h // 5  # only search in the top/bottom 20 %
 
     def _gap_from_top(profile, end):
@@ -182,18 +182,18 @@ def _ocr_page(
     no_legacy_polygons: bool = False,
     temperature: float = 1.0,
 ) -> tuple[str, list[float]]:
-    """Full kraken pipeline: binarize → segment → ocr.
+    """Full kraken pipeline: binarize -> segment -> ocr.
 
     Prefers the kraken CLI (the exact pipeline from the documentation):
         kraken -i page.png out.txt binarize segment ocr -m model.mlmodel
     Falls back to the Python API when the CLI is not on PATH (dev environments).
 
-    orig_bytes: original colour/grey page render — the CLI binarises this itself;
+    orig_bytes: original colour/grey page render -- the CLI binarises this itself;
                 the Python-API fallback also binarises internally before segmenting.
     """
     import shutil, subprocess, sys, tempfile
 
-    # ── Locate the kraken CLI ─────────────────────────────────────────────
+    # -- Locate the kraken CLI -------------------------------------------------
     # When installed via pip the script lives next to the Python executable.
     kraken_bin = shutil.which("kraken") or os.path.join(
         os.path.dirname(sys.executable), "kraken"
@@ -208,36 +208,23 @@ def _ocr_page(
             txt_path = os.path.join(tmpdir, "page.txt")
             Image.open(io.BytesIO(orig_bytes)).save(img_path, format="PNG")
 
-            # Match the documented pipeline:
-            #   kraken -i img.png out.txt segment -d DIR ocr -m MODEL ...
-            # Note: binarize is intentionally omitted — BLLA works directly on
-            # the colour render, and skipping it matches the Colab-verified flow.
             cmd = [
                 kraken_bin,
                 "-i", img_path, txt_path,
                 "segment", "-d", text_direction,
                 "ocr", "-m", _MODEL_PATH, "-p", str(pad),
             ]
-            # Bidi reordering.
-            # For Arabic (RTL), --base-dir R gives better word ordering than
-            # Unicode auto-detect.  "auto" and "R" both use R as base; only
-            # explicit LTR or off deviates from this.
             if bidi_key == "off":
                 cmd.append("--no-reorder")
             elif bidi_key == "L":
                 cmd += ["--base-dir", "L", "--reorder"]
             else:  # "R" or "auto"
                 cmd += ["--base-dir", "R", "--reorder"]
-            # Optional ocr flags
             if no_legacy_polygons:
                 cmd.append("--no-legacy-polygons")
             if temperature != 1.0:
                 cmd += ["-t", str(temperature)]
 
-            # Completely clear PYTHONPATH so the subprocess uses only the venv's
-            # site-packages and cannot pick up any local directory that shadows
-            # the installed kraken package (Streamlit may inject the project root
-            # via sitecustomize.py in addition to PYTHONPATH).
             env = os.environ.copy()
             env["PYTHONPATH"] = ""
 
@@ -249,17 +236,13 @@ def _ocr_page(
                 if proc.returncode == 0 and os.path.exists(txt_path):
                     with open(txt_path, encoding="utf-8") as f:
                         return f.read().strip(), []
-                cli_stderr = proc.stderr  # save for warning; fall through below
+                cli_stderr = proc.stderr
             except subprocess.TimeoutExpired:
                 cli_stderr = "CLI timed out (>300 s)"
 
-    # ── Python API fallback (dev / CLI-not-available / CLI-failed) ───────
-    # cli_stderr is non-empty when the CLI was found but failed.
     if cli_stderr:
-        # Surface the CLI failure as a Streamlit warning (not an exception)
-        # so the user knows the fallback path was taken.
         import streamlit as _st
-        _st.warning(f"kraken CLI failed — using Python API fallback.\n\n```\n{cli_stderr}\n```")
+        _st.warning(f"kraken CLI failed -- using Python API fallback.\n\n```\n{cli_stderr}\n```")
 
     from kraken import blla, binarization as _kbin, rpred as krpred
     model = _load_model()
@@ -311,7 +294,7 @@ def _ocr_page_claude(orig_bytes: bytes) -> tuple[str, list[float]]:
     if not api_key:
         raise ValueError(
             "ANTHROPIC_API_KEY not found. "
-            "Add it to Streamlit secrets (Settings → Secrets) or set the environment variable."
+            "Add it to Streamlit secrets (Settings -> Secrets) or set the environment variable."
         )
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -337,9 +320,9 @@ def _ocr_page_claude(orig_bytes: bytes) -> tuple[str, list[float]]:
                         "Extract all Arabic text from this page image exactly as written.\n"
                         "• Preserve all diacritical marks (tashkeel) precisely.\n"
                         "• For Quranic pages: keep verse numbers in Arabic-Indic numerals "
-                        "  e.g. ﴿١٢٣﴾ or (١٢٣).\n"
+                        "  e.g. \u﴿١٢٣\u﴾ or (١٢٣).\n"
                         "• Separate paragraphs with a blank line.\n"
-                        "• Output ONLY the extracted text — no labels, commentary, "
+                        "• Output ONLY the extracted text -- no labels, commentary, "
                         "  or translation."
                     ),
                 },
@@ -357,8 +340,8 @@ def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def _build_pdf(png_paths: tuple[str, ...], dpi: int) -> bytes:
-    # Grayscale + half-size: reduces peak RAM ~12× vs full-colour originals.
-    # At 400 DPI source, the PDF is effectively 200 DPI — adequate for reading.
+    # Grayscale + half-size: reduces peak RAM ~12x vs full-colour originals.
+    # At 400 DPI source, the PDF is effectively 200 DPI -- adequate for reading.
     images = []
     for path in png_paths:
         img = Image.open(path).convert("L")
@@ -398,14 +381,14 @@ def _sidebar_settings() -> dict:
     with st.sidebar:
         st.header("Settings")
 
-        # ── Image quality ────────────────────────────────────────────────
+        # -- Image quality ----------------------------------------------------
         st.subheader("Image quality")
         dpi = st.slider(
             "Rendering DPI", MIN_DPI, MAX_DPI, DEFAULT_DPI, step=50,
             help="Higher DPI = sharper image. 400 DPI is optimal for Apple Live Text.",
         )
 
-        # ── Crop margins ──────────────────────────────────────────────────
+        # -- Crop margins -----------------------------------------------------
         # Slider keys are pre-seeded in main() before this function runs so
         # there is never a value= / session_state conflict (Streamlit 1.57+).
         st.subheader("Crop margins")
@@ -415,7 +398,7 @@ def _sidebar_settings() -> dict:
             key="auto_detect_crop",
             help=(
                 "Scan ink density to locate header/footer gaps on page 1. "
-                "Sliders update automatically — adjust to fine-tune."
+                "Sliders update automatically -- adjust to fine-tune."
             ),
         )
         top_crop_pct = st.slider(
@@ -431,11 +414,7 @@ def _sidebar_settings() -> dict:
             help="White border added around the cropped image.",
         )
 
-        # ── OCR (optional) ────────────────────────────────────────────────
-        # The primary purpose of this app is to produce high-quality cropped
-        # colour images for Apple Live Text (offline, free, near-perfect Arabic).
-        # OCR via Claude Haiku or kraken is an optional extra for cases where
-        # a digital text file is also needed.
+        # -- OCR (optional) ---------------------------------------------------
         st.subheader("OCR (optional)")
         run_ocr = st.checkbox(
             "Extract text as well",
@@ -471,8 +450,8 @@ def _sidebar_settings() -> dict:
 
             if engine == "claude" and not _anthropic_key():
                 st.warning(
-                    "ANTHROPIC_API_KEY not set — kraken will be used as fallback. "
-                    "Add the key in **Settings → Secrets** to enable Claude.",
+                    "ANTHROPIC_API_KEY not set -- kraken will be used as fallback. "
+                    "Add the key in **Settings -> Secrets** to enable Claude.",
                     icon="⚠️",
                 )
 
@@ -483,7 +462,7 @@ def _sidebar_settings() -> dict:
                 threshold_pct = st.slider(
                     "Binarization threshold (nlbin)", 10, 90, 50, step=5,
                     help=(
-                        "nlbin threshold (0.10–0.90). "
+                        "nlbin threshold (0.10-0.90). "
                         "Raise if faint strokes vanish; lower if background noise bleeds in."
                     ),
                 )
@@ -525,7 +504,7 @@ def _sidebar_settings() -> dict:
                 ),
             )
 
-        # ── Active config summary ─────────────────────────────────────────
+        # -- Active config summary --------------------------------------------
         with st.expander("Active configuration", expanded=False):
             cfg_json: dict = {
                 "dpi": dpi,
@@ -572,7 +551,7 @@ def _sidebar_settings() -> dict:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Arabic PDF OCR", page_icon="📄", layout="wide")
+    st.set_page_config(page_title="Arabic PDF OCR", page_icon="\U0001f4c4", layout="wide")
     st.title("Arabic PDF OCR")
 
     # Seed crop slider keys with defaults BEFORE _sidebar_settings() renders widgets.
@@ -599,7 +578,7 @@ def main() -> None:
         return
 
     for file_obj in uploaded_files:
-        # Cache raw bytes — st.rerun() moves the UploadedFile cursor to EOF.
+        # Cache raw bytes -- st.rerun() moves the UploadedFile cursor to EOF.
         pdf_cache_key = f"pdf_{file_obj.name}_{file_obj.size}"
         if pdf_cache_key not in st.session_state:
             raw = file_obj.read()
@@ -607,7 +586,7 @@ def main() -> None:
                 st.session_state[pdf_cache_key] = raw
         pdf_bytes = st.session_state.get(pdf_cache_key)
         if not pdf_bytes:
-            st.error(f"Could not read '{file_obj.name}' — please re-upload.")
+            st.error(f"Could not read '{file_obj.name}' -- please re-upload.")
             continue
 
         file_hash = get_file_hash(pdf_bytes)
@@ -620,7 +599,7 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # ── Auto-detect margins (once per file) ───────────────────────────
+        # -- Auto-detect margins (once per file) ------------------------------
         det_key = f"crop_det_{file_hash}"
         if cfg["auto_detect"] and det_key not in st.session_state:
             with st.spinner("Detecting header/footer margins from page 1…"):
@@ -632,15 +611,15 @@ def main() -> None:
             st.session_state[det_key] = True
             st.rerun()
 
-        # Wizard state ─────────────────────────────────────────────────────
+        # Wizard state --------------------------------------------------------
         wiz_page_key = f"wiz_page_{file_hash}"
         wiz_done_key = f"wiz_done_{file_hash}"
         if wiz_page_key not in st.session_state:
             st.session_state[wiz_page_key] = 1
 
-        # ══════════════════════════════════════════════════════════════════
-        # DOWNLOAD VIEW — all pages cropped, optional OCR, download buttons.
-        # ══════════════════════════════════════════════════════════════════
+        # =====================================================================
+        # DOWNLOAD VIEW -- all pages cropped, optional OCR, download buttons.
+        # =====================================================================
         if st.session_state.get(wiz_done_key, False):
             # Each cropped page is written to a temp file immediately after
             # cropping so the download data is always the exact cropped PNG,
@@ -672,6 +651,7 @@ def main() -> None:
                 pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
 
                 # Write the cropped PNG once; reuse on subsequent reruns.
+                # Visited pages already have their file written by the wizard view.
                 if not os.path.exists(png_path):
                     ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
                     h  = Image.open(io.BytesIO(ob)).height
@@ -723,7 +703,7 @@ def main() -> None:
                 all_texts.append(text)
             prog.empty()
 
-            # Bulk download buttons — builders read from temp files.
+            # Bulk download buttons -- builders read from temp files.
             st.markdown("**Download all pages as:**")
             n_cols = 4 if cfg["run_ocr"] else 3
             dl_cols = st.columns(n_cols)
@@ -769,13 +749,13 @@ def main() -> None:
                 st.session_state[wiz_done_key] = False
                 st.rerun()
 
-        # ══════════════════════════════════════════════════════════════════
-        # WIZARD VIEW — one page at a time with crop sliders and navigation.
-        # ══════════════════════════════════════════════════════════════════
+        # =====================================================================
+        # WIZARD VIEW -- one page at a time with crop sliders and navigation.
+        # =====================================================================
         else:
             current = st.session_state[wiz_page_key]
 
-            # Per-page crop keys — initialise from global setting on first visit.
+            # Per-page crop keys -- initialise from global setting on first visit.
             p_top_key = f"p_top_{file_hash}_{current}"
             p_bot_key = f"p_bot_{file_hash}_{current}"
             if p_top_key not in st.session_state:
@@ -783,17 +763,17 @@ def main() -> None:
             if p_bot_key not in st.session_state:
                 st.session_state[p_bot_key] = cfg["bot_crop_pct"]
 
-            # Crop sliders — placed ABOVE the preview so the user sets values
+            # Crop sliders -- placed ABOVE the preview so the user sets values
             # before reading the result.
             st.caption(f"**Page {current} of {total}**")
             sl_left, sl_right = st.columns(2)
             sl_left.slider(
-                f"Top crop (%) — page {current}", 0, 50, step=1,
+                f"Top crop (%) -- page {current}", 0, 50, step=1,
                 key=p_top_key,
                 help="Rows to remove from the top of this page.",
             )
             sl_right.slider(
-                f"Bottom crop (%) — page {current}", 0, 50, step=1,
+                f"Bottom crop (%) -- page {current}", 0, 50, step=1,
                 key=p_bot_key,
                 help="Rows to remove from the bottom of this page.",
             )
@@ -807,14 +787,24 @@ def main() -> None:
             bot_px   = round(page_bot / 100 * h_page)
             cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
 
+            # Save to temp file immediately -- this exact PNG is what gets
+            # downloaded, so wizard preview and saved output are always identical.
+            tmpdir_key = f"tmpdir_{file_hash}"
+            if tmpdir_key not in st.session_state:
+                st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
+            _wiz_png = os.path.join(st.session_state[tmpdir_key],
+                                    f"page{current:03d}.png")
+            with open(_wiz_png, "wb") as _fh:
+                _fh.write(cropped_bytes)
+
             # Preview: overlay left, cropped result right.
             overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
             col_left, col_right = st.columns(2)
             col_left.image(overlay_bytes, width="stretch",
-                           caption=f"Page {current} — crop lines")
+                           caption=f"Page {current} -- crop lines")
             col_right.image(Image.open(io.BytesIO(cropped_bytes)),
                             width="stretch",
-                            caption=f"Page {current} — result")
+                            caption=f"Page {current} -- result")
             col_right.download_button(
                 f"↓ Page {current} (PNG)",
                 data=cropped_bytes,
