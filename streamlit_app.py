@@ -320,7 +320,7 @@ def _ocr_page_claude(orig_bytes: bytes) -> tuple[str, list[float]]:
                         "Extract all Arabic text from this page image exactly as written.\n"
                         "• Preserve all diacritical marks (tashkeel) precisely.\n"
                         "• For Quranic pages: keep verse numbers in Arabic-Indic numerals "
-                        "  e.g. \u﴿١٢٣\u﴾ or (١٢٣).\n"
+                        "  e.g. ﴿١٢٣﴾ or (١٢٣).\n"
                         "• Separate paragraphs with a blank line.\n"
                         "• Output ONLY the extracted text -- no labels, commentary, "
                         "  or translation."
