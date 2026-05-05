@@ -110,7 +110,7 @@ def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
 
     INK_ROW  = 0.004   # row is "inky" if > 0.4 % of width is dark
     GAP_ROWS = 20      # gap must span >= 20 blank rows
-    ZONE     = h // 5  # only search in the top/bottom 20 %
+    ZONE     = h // 3  # only search in the top/bottom 33 %
 
     def _gap_from_top(profile, end):
         in_ink = blank = 0
@@ -428,11 +428,11 @@ def _sidebar_settings() -> dict:
             ),
         )
         top_crop_pct = st.slider(
-            "Top crop (%)", 0, 50, step=1, key="top_crop_pct",
+            "Top crop (%)", 0, 75, step=1, key="top_crop_pct",
             help="Percentage of page height removed from the top edge (page-number row, etc.).",
         )
         bot_crop_pct = st.slider(
-            "Bottom crop (%)", 0, 50, step=1, key="bot_crop_pct",
+            "Bottom crop (%)", 0, 75, step=1, key="bot_crop_pct",
             help="Percentage of page height removed from the bottom edge (footer, running title).",
         )
         pad_px = st.slider(
@@ -632,8 +632,8 @@ def main() -> None:
                 bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
                 top_px_det, bot_px_det = _detect_margins(bw_p1)
                 h_p1 = Image.open(io.BytesIO(bw_p1)).height
-            st.session_state["_pending_top_crop_pct"] = min(50, round(top_px_det / h_p1 * 100))
-            st.session_state["_pending_bot_crop_pct"] = min(50, round(bot_px_det / h_p1 * 100))
+            st.session_state["_pending_top_crop_pct"] = min(75, round(top_px_det / h_p1 * 100))
+            st.session_state["_pending_bot_crop_pct"] = min(75, round(bot_px_det / h_p1 * 100))
             st.session_state[det_key] = True
             st.rerun()
 
@@ -793,8 +793,8 @@ def main() -> None:
                             top_px, bot_px, h_det, _ = _detect_margins_v2(
                                 pdf_bytes, current, cfg["dpi"]
                             )
-                            st.session_state[p_top_key] = min(50, round(top_px / h_det * 100))
-                            st.session_state[p_bot_key] = min(50, round(bot_px / h_det * 100))
+                            st.session_state[p_top_key] = min(75, round(top_px / h_det * 100))
+                            st.session_state[p_bot_key] = min(75, round(bot_px / h_det * 100))
                         except Exception:
                             st.session_state[p_top_key] = cfg["top_crop_pct"]
                             st.session_state[p_bot_key] = cfg["bot_crop_pct"]
@@ -807,12 +807,12 @@ def main() -> None:
             st.caption(f"**Page {current} of {total}**")
             sl_left, sl_right = st.columns(2)
             sl_left.slider(
-                f"Top crop (%) -- page {current}", 0, 50, step=1,
+                f"Top crop (%) -- page {current}", 0, 75, step=1,
                 key=p_top_key,
                 help="Rows to remove from the top of this page.",
             )
             sl_right.slider(
-                f"Bottom crop (%) -- page {current}", 0, 50, step=1,
+                f"Bottom crop (%) -- page {current}", 0, 75, step=1,
                 key=p_bot_key,
                 help="Rows to remove from the bottom of this page.",
             )
