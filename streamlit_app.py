@@ -140,6 +140,26 @@ def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
 
 
 @st.cache_data(show_spinner=False)
+def _detect_margins_v2(pdf_bytes: bytes, page_num: int, dpi: int) -> tuple[int, int, int, int]:
+    """Smart per-page header/footer detection using header_footer.py.
+
+    Returns (top_crop_px, bot_crop_px, page_h, page_w) at `dpi`.
+    top_crop_px: pixels to remove from the top.
+    bot_crop_px: pixels to remove from the bottom.
+    """
+    import fitz
+    from header_footer import detect_margins, Params
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num - 1]
+    m = detect_margins(page, Params(dpi=dpi))
+    doc.close()
+    top_crop_px = m.keep_top
+    bot_crop_px = max(0, m.page_h - 1 - m.keep_bottom)
+    return top_crop_px, bot_crop_px, m.page_h, m.page_w
+
+
+@st.cache_data(show_spinner=False)
 def _apply_crop(orig_bytes: bytes, top_px: int, bot_px: int, pad_px: int) -> bytes:
     """Crop top_px / bot_px rows then add pad_px white border. Returns PNG bytes."""
     img = Image.open(io.BytesIO(orig_bytes))
@@ -392,13 +412,19 @@ def _sidebar_settings() -> dict:
         # Slider keys are pre-seeded in main() before this function runs so
         # there is never a value= / session_state conflict (Streamlit 1.57+).
         st.subheader("Crop margins")
-        auto_detect = st.checkbox(
-            "Auto-detect from first page",
-            value=True,
-            key="auto_detect_crop",
+        detect_mode = st.radio(
+            "Auto-detect margins",
+            ["Off", "Fast (page 1)", "Smart (per page)"],
+            index=1,
+            key="detect_mode",
             help=(
-                "Scan ink density to locate header/footer gaps on page 1. "
-                "Sliders update automatically -- adjust to fine-tune."
+                "**Off**: use the sliders below as-is for all pages.\n\n"
+                "**Fast (page 1)**: scans ink density on page 1 and pre-fills "
+                "the sliders — same crop applied to every page.\n\n"
+                "**Smart (per page)**: uses morphological analysis (OpenCV) to "
+                "detect header, running title, footnote rule, and page-number "
+                "footer independently for each page as you step through the wizard. "
+                "Handles pages where a footnote takes most of the space."
             ),
         )
         top_crop_pct = st.slider(
@@ -508,7 +534,7 @@ def _sidebar_settings() -> dict:
         with st.expander("Active configuration", expanded=False):
             cfg_json: dict = {
                 "dpi": dpi,
-                "auto_detect_crop": auto_detect,
+                "detect_mode": detect_mode,
                 "top_crop_pct": top_crop_pct,
                 "bot_crop_pct": bot_crop_pct,
                 "pad_px": pad_px,
@@ -533,7 +559,7 @@ def _sidebar_settings() -> dict:
 
     return dict(
         dpi=dpi,
-        auto_detect=auto_detect,
+        detect_mode=detect_mode,
         top_crop_pct=top_crop_pct,
         bot_crop_pct=bot_crop_pct,
         pad_px=pad_px,
@@ -599,9 +625,9 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # -- Auto-detect margins (once per file) ------------------------------
+        # -- Auto-detect margins (Fast mode: once per file on page 1) ---------
         det_key = f"crop_det_{file_hash}"
-        if cfg["auto_detect"] and det_key not in st.session_state:
+        if cfg["detect_mode"] == "Fast (page 1)" and det_key not in st.session_state:
             with st.spinner("Detecting header/footer margins from page 1…"):
                 bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
                 top_px_det, bot_px_det = _detect_margins(bw_p1)
@@ -755,13 +781,26 @@ def main() -> None:
         else:
             current = st.session_state[wiz_page_key]
 
-            # Per-page crop keys -- initialise from global setting on first visit.
+            # Per-page crop keys -- initialise on first visit.
+            # Smart mode: run detect_margins() for this specific page.
+            # Other modes: use the global sidebar slider value.
             p_top_key = f"p_top_{file_hash}_{current}"
             p_bot_key = f"p_bot_{file_hash}_{current}"
             if p_top_key not in st.session_state:
-                st.session_state[p_top_key] = cfg["top_crop_pct"]
-            if p_bot_key not in st.session_state:
-                st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+                if cfg["detect_mode"] == "Smart (per page)":
+                    with st.spinner(f"Smart-detecting margins on page {current}…"):
+                        try:
+                            top_px, bot_px, h_det, _ = _detect_margins_v2(
+                                pdf_bytes, current, cfg["dpi"]
+                            )
+                            st.session_state[p_top_key] = min(50, round(top_px / h_det * 100))
+                            st.session_state[p_bot_key] = min(50, round(bot_px / h_det * 100))
+                        except Exception:
+                            st.session_state[p_top_key] = cfg["top_crop_pct"]
+                            st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+                else:
+                    st.session_state[p_top_key] = cfg["top_crop_pct"]
+                    st.session_state[p_bot_key] = cfg["bot_crop_pct"]
 
             # Crop sliders -- placed ABOVE the preview so the user sets values
             # before reading the result.

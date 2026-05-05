@@ -6,3 +6,5 @@ kraken==7.0.1
 pdf2image
 pillow
 numpy
+pymupdf
+opencv-python-headless
