@@ -396,6 +396,46 @@ def _build_zip(png_paths: tuple[str, ...], stem: str) -> bytes:
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False)
+def _batch_export(pdf_bytes: bytes, dpi: int) -> tuple[bytes, bytes]:
+    """Full auto-detect pipeline in one call.
+
+    1. Strip headers/footers (CropBox, lossless) via header_footer.detect_margins.
+    2. Render each stripped page to a colour PNG at `dpi` and zip them.
+    3. Extract footer regions from the original into a labeled PDF.
+
+    Returns (zip_bytes, footers_pdf_bytes).
+    footers_pdf_bytes is b"" when no footers are detected.
+    """
+    from header_footer import strip_pdf, Params
+    from page_export import export_pages_as_images, extract_footers_pdf
+
+    p = Params(dpi=dpi)
+    with tempfile.TemporaryDirectory(prefix="ocr_batch_") as tmpdir:
+        src_path   = os.path.join(tmpdir, "input.pdf")
+        strip_path = os.path.join(tmpdir, "stripped.pdf")
+        img_dir    = os.path.join(tmpdir, "pages")
+        zip_path   = os.path.join(tmpdir, "pages.zip")
+        foot_path  = os.path.join(tmpdir, "footers.pdf")
+
+        with open(src_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        strip_pdf(src_path, strip_path, p)
+        export_pages_as_images(strip_path, img_dir, dpi=dpi, zip_path=zip_path)
+        contributed = extract_footers_pdf(src_path, foot_path, p=p)
+
+        with open(zip_path, "rb") as f:
+            zip_bytes = f.read()
+
+        foot_bytes = b""
+        if contributed and os.path.exists(foot_path):
+            with open(foot_path, "rb") as f:
+                foot_bytes = f.read()
+
+    return zip_bytes, foot_bytes
+
+
 def _sidebar_settings() -> dict:
     """Render all sidebar controls and return a dict of current values."""
     with st.sidebar:
@@ -530,6 +570,34 @@ def _sidebar_settings() -> dict:
                 ),
             )
 
+        # -- Batch Export -----------------------------------------------------
+        st.subheader("Batch Export")
+        st.caption(
+            "Auto-detect headers/footers, export clean page images as a ZIP, "
+            "and collect footnotes into a separate PDF — all in one step. "
+            "No page-by-page review required."
+        )
+        batch_mode = st.checkbox(
+            "Enable Batch Export",
+            value=False,
+            key="batch_mode",
+            help=(
+                "When enabled, each uploaded file shows a **▶ Run** button that "
+                "processes the whole document automatically using Smart detection:\n\n"
+                "1. Strip headers/footers on every page.\n"
+                "2. Export clean colour page images as a ZIP.\n"
+                "3. Collect all footnote sections into a labeled PDF."
+            ),
+        )
+        batch_include_footers = False
+        if batch_mode:
+            batch_include_footers = st.checkbox(
+                "Include footers PDF",
+                value=True,
+                key="batch_include_footers",
+                help="Assemble all detected footnote regions into a separate labeled PDF.",
+            )
+
         # -- Active config summary --------------------------------------------
         with st.expander("Active configuration", expanded=False):
             cfg_json: dict = {
@@ -573,6 +641,8 @@ def _sidebar_settings() -> dict:
         no_legacy_polygons=no_legacy_polygons,
         temperature=temperature,
         apply_corrections=apply_corrections,
+        batch_mode=batch_mode,
+        batch_include_footers=batch_include_footers,
     )
 
 
@@ -624,6 +694,58 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
+
+        # =====================================================================
+        # BATCH EXPORT — one-click full pipeline (sidebar toggle).
+        # =====================================================================
+        if cfg["batch_mode"]:
+            batch_trig_key = f"batch_triggered_{file_hash}"
+            with st.expander(f"Batch Export — {file_obj.name}", expanded=True):
+                btn_col, info_col = st.columns([1, 4])
+                if btn_col.button("▶ Run", key=f"batch_btn_{file_hash}",
+                                  type="primary", use_container_width=True):
+                    st.session_state[batch_trig_key] = True
+                    st.rerun()
+                info_col.caption(
+                    "Strips headers/footers automatically, exports all pages as "
+                    "colour PNGs in a ZIP" +
+                    (", and builds a footnotes PDF." if cfg["batch_include_footers"]
+                     else ".")
+                )
+
+                if st.session_state.get(batch_trig_key):
+                    with st.spinner(
+                        f"Running batch export for {file_obj.name} — "
+                        f"{total} page(s) at {cfg['dpi']} DPI…"
+                    ):
+                        zip_bytes, foot_bytes = _batch_export(pdf_bytes, cfg["dpi"])
+
+                    st.success(
+                        f"Done — {total} page(s) processed.",
+                        icon="✅",
+                    )
+                    show_footers = cfg["batch_include_footers"] and bool(foot_bytes)
+                    dl_cols = st.columns(2 if show_footers else 1)
+                    dl_cols[0].download_button(
+                        "⬇ Pages ZIP",
+                        data=zip_bytes,
+                        file_name=f"{stem}_pages.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key=f"batch_zip_{file_hash}",
+                    )
+                    if show_footers:
+                        dl_cols[1].download_button(
+                            "⬇ Footers PDF",
+                            data=foot_bytes,
+                            file_name=f"{stem}_footers.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key=f"batch_foot_{file_hash}",
+                        )
+                    elif cfg["batch_include_footers"] and not foot_bytes:
+                        st.info("No footnote sections were detected in this document.")
+            st.divider()
 
         # -- Auto-detect margins (Fast mode: once per file on page 1) ---------
         det_key = f"crop_det_{file_hash}"
