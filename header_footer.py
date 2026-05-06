@@ -1,58 +1,21 @@
 """
 Programmatic header/footer detection and stripping for scanned Arabic PDFs.
 
-Design goals
-------------
-- Work on born-image PDFs (every page is one scan), since text-coordinate methods
-  do not apply.
-- Be content-aware: do NOT crop fixed percentages. The footer in particular varies
-  drastically between pages (footnote-heavy pages vs. pages with no footnote at all).
-- Be robust to scanner artifacts (ink streaks at the very top/bottom edges).
-- Produce per-page crop boxes plus a cleaned output PDF.
+Algorithm overview (per page, rendered to grayscale + Otsu-binarized):
+1. Strip outer scanner noise via column-density profile.
+2. Build a line-strip profile (smoothed row-wise ink density).
+3. Detect footnote separator via morphological horizontal-rule detection +
+   whitespace-isolation gate (rejects calligraphic strokes that pass
+   morphology but are embedded in tapering ink rather than clean whitespace).
+4. Detect running header (narrow/short strip near top with large gap below).
+5. Detect non-separator footer (narrow/short strip near bottom with large gap above).
+6. Compose keep-region with padding, clamped to body bounds.
+7. Apply crop: "cropbox" (lossless CropBox) or "raster" (re-render PNGs).
 
-Algorithm overview
-------------------
-Per page (rendered to grayscale at a fixed DPI, then Otsu-binarized):
-
-1. Strip outer scanner noise. Compute an "active" left/right margin using a robust
-   column-density profile, then ignore everything outside it for vertical analysis.
-
-2. Build a *line-strip* profile. Smooth the row-wise ink density with a kernel
-   roughly the height of an Arabic line, and extract contiguous runs above a low
-   threshold. Each run is a candidate text line.
-
-3. Detect a footnote separator. A footnote separator is a short horizontal rule
-   (typically 1/4 to 1/2 of the text-column width). We detect any horizontal line
-   via morphological opening with a long horizontal structuring element and treat
-   the topmost rule that has at least two body line strips above it as the footer
-   boundary. This single signal handles the hardest case in the sample, where the
-   footnote on page 2 takes 70% of the page (rule sits at only 30% from the top).
-
-4. Detect the running header. A running header is a SHORT line strip near the top
-   (typically within the first ~10% of page height) whose vertical gap to the next
-   line strip is significantly larger than the inter-line gap of the body. If both
-   conditions hold, classify it as header and exclude it.
-
-5. Detect a non-separator footer (page numbers, running titles at the bottom).
-   Same logic mirrored: a short, isolated strip near the bottom separated from the
-   last body line by an unusually large gap.
-
-6. Compose the keep-region. The kept area is `[header_bottom + small_pad,
-   footer_top - small_pad]` vertically, and `[left_active, right_active]`
-   horizontally. We never crop into the body; if a signal is ambiguous we err on
-   the side of keeping content.
-
-7. Apply the crop. Either rasterize the cropped region into a new image-PDF, or
-   set the page's CropBox in a copy of the original PDF (cheaper, lossless).
-
-This file exposes:
-    Params(...)                         configuration dataclass; see fields
+Public API:
+    Params(...)
     detect_margins(page, p, verbose=False) -> PageMargins
-    strip_pdf(in_path, out_path, p=Params(), mode=..., verbose=False)
-        mode: "cropbox" (lossless, default) or "raster" (re-render at p.dpi)
-
-Defaults: 300 DPI rendering, 50 px top/bottom padding, original L/R margins
-preserved, no diagnostic notes (set `verbose=True` to populate them).
+    strip_pdf(in_path, out_path, p=Params(), mode="cropbox", verbose=False)
 """
 
 from __future__ import annotations
@@ -65,10 +28,6 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Tunable parameters
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Params:
@@ -83,15 +42,16 @@ class Params:
     footer_band_frac: float = 0.10
     rule_min_len_frac: float = 0.12
     rule_max_len_frac: float = 0.95
-    rule_thickness_max_px: int = 6
+    # Raised to 12 from v2's 6 — handles bolder-press rules (7-9 px).
+    # The whitespace-isolation gate below rejects non-rule horizontals.
+    rule_thickness_max_px: int = 12
+    rule_isolation_px: int = 18
+    rule_isolation_max_ink_frac: float = 0.02
+    rule_extent_max_walk_px: int = 30
     pad_top_px: int = 50
     pad_bottom_px: int = 50
     pad_side_px: int = 0
 
-
-# ---------------------------------------------------------------------------
-# Core detection
-# ---------------------------------------------------------------------------
 
 @dataclass
 class PageMargins:
@@ -108,18 +68,14 @@ class PageMargins:
     notes: list[str]
 
     def __repr__(self) -> str:
-        flags = []
-        if self.header_strip:
-            flags.append("H")
-        if self.rule_y is not None:
-            flags.append("R")
-        if self.footer_strip:
-            flags.append("F")
-        tag = "".join(flags) or "-"
+        flags = "".join(
+            f for f, v in [("H", self.header_strip), ("R", self.rule_y), ("F", self.footer_strip)]
+            if v is not None
+        ) or "-"
         return (
             f"PageMargins(page={self.page_index}, "
             f"keep=x[{self.keep_left}..{self.keep_right}] "
-            f"y[{self.keep_top}..{self.keep_bottom}], flags={tag})"
+            f"y[{self.keep_top}..{self.keep_bottom}], flags={flags})"
         )
 
 
@@ -134,7 +90,6 @@ def _render_gray(page: fitz.Page, dpi: int) -> np.ndarray:
 
 
 def _binarize(gray: np.ndarray) -> np.ndarray:
-    """Return ink=255, paper=0 (uint8)."""
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     return bw
 
@@ -148,15 +103,12 @@ def _active_columns(bw: np.ndarray, side_frac: float) -> tuple[int, int]:
     cols = np.where(sm > thr)[0]
     if not len(cols):
         return int(W * side_frac), int(W * (1 - side_frac))
-    left, right = int(cols[0]), int(cols[-1])
-    left = max(left, int(W * 0.01))
-    right = min(right, W - 1 - int(W * 0.01))
+    left = max(int(cols[0]), int(W * 0.01))
+    right = min(int(cols[-1]), W - 1 - int(W * 0.01))
     return left, right
 
 
-def _line_runs(
-    bw: np.ndarray, left: int, right: int, p: Params
-) -> list[tuple[int, int, float]]:
+def _line_runs(bw: np.ndarray, left: int, right: int, p: Params) -> list[tuple[int, int, float]]:
     H, W = bw.shape
     central = bw[:, left : right + 1]
     band_w = central.shape[1]
@@ -171,21 +123,63 @@ def _line_runs(
     for r in range(H):
         if is_line[r] and not in_run:
             in_run, s = True, r
-        elif (not is_line[r]) and in_run:
+        elif not is_line[r] and in_run:
             in_run = False
             runs.append((s, r - 1))
     if in_run:
         runs.append((s, H - 1))
 
     min_h = max(3, int(round(p.min_line_height_frac * H)))
-    runs = [(a, b) for (a, b) in runs if (b - a + 1) >= min_h]
-
     out: list[tuple[int, int, float]] = []
     for a, b in runs:
-        sub = central[a : b + 1]
-        col_has_ink = (sub.sum(axis=0) > 0).sum()
+        if (b - a + 1) < min_h:
+            continue
+        col_has_ink = (central[a : b + 1].sum(axis=0) > 0).sum()
         out.append((a, b, col_has_ink / band_w))
     return out
+
+
+def _is_isolated_horizontal(bw_band: np.ndarray, y_mid: int, p: Params) -> bool:
+    """True iff `y_mid` sits alone in whitespace (real rule, not calligraphic stroke)."""
+    H, band_w = bw_band.shape
+    if band_w == 0:
+        return False
+    row_ink = (bw_band > 0).sum(axis=1) / band_w
+
+    above_top: Optional[int] = None
+    for dy in range(1, p.rule_extent_max_walk_px + 1):
+        y = y_mid - dy
+        if y < 0:
+            break
+        if row_ink[y] < p.rule_isolation_max_ink_frac:
+            above_top = y
+            break
+    if above_top is None:
+        return False
+
+    below_bot: Optional[int] = None
+    for dy in range(1, p.rule_extent_max_walk_px + 1):
+        y = y_mid + dy
+        if y >= H:
+            break
+        if row_ink[y] < p.rule_isolation_max_ink_frac:
+            below_bot = y
+            break
+    if below_bot is None:
+        return False
+
+    half_iso = p.rule_isolation_px // 2
+    above_lo = max(0, above_top - p.rule_isolation_px + 1)
+    above_hi = above_top + 1
+    below_lo = below_bot
+    below_hi = min(H, below_bot + p.rule_isolation_px)
+    if (above_hi - above_lo) < half_iso or (below_hi - below_lo) < half_iso:
+        return False
+
+    return (
+        row_ink[above_lo:above_hi].max() < p.rule_isolation_max_ink_frac
+        and row_ink[below_lo:below_hi].max() < p.rule_isolation_max_ink_frac
+    )
 
 
 def _detect_horizontal_rules(bw: np.ndarray, left: int, right: int, p: Params) -> list[int]:
@@ -214,54 +208,42 @@ def _detect_horizontal_rules(bw: np.ndarray, left: int, right: int, p: Params) -
 
     out: list[int] = []
     for g in groups:
-        if (g[-1] - g[0] + 1) <= p.rule_thickness_max_px:
-            y_mid = (g[0] + g[-1]) // 2
-            if y_mid < int(0.015 * H) or y_mid > int(0.985 * H):
-                continue
-            out.append(y_mid)
+        if (g[-1] - g[0] + 1) > p.rule_thickness_max_px:
+            continue
+        y_mid = (g[0] + g[-1]) // 2
+        if y_mid < int(0.015 * H) or y_mid > int(0.985 * H):
+            continue
+        if not _is_isolated_horizontal(band, y_mid, p):
+            continue
+        out.append(y_mid)
     return out
 
 
 class _NullNotes(list):
-    """Silently drops append calls when verbose=False."""
     __slots__ = ()
     def append(self, _item) -> None:
         pass
 
 
-def detect_margins(
-    page: fitz.Page,
-    p: Params = Params(),
-    *,
-    verbose: bool = False,
-) -> PageMargins:
-    """Run the full detection pipeline on a single PDF page."""
+def detect_margins(page: fitz.Page, p: Params = Params(), *, verbose: bool = False) -> PageMargins:
     notes: list[str] = [] if verbose else _NullNotes()
     gray = _render_gray(page, p.dpi)
     bw = _binarize(gray)
     H, W = bw.shape
 
     left, right = _active_columns(bw, p.side_margin_frac)
-    if p.preserve_horizontal:
-        keep_left_default, keep_right_default = 0, W - 1
-    else:
-        keep_left_default, keep_right_default = left, right
+    keep_left_default = 0 if p.preserve_horizontal else left
+    keep_right_default = W - 1 if p.preserve_horizontal else right
 
     runs = _line_runs(bw, left, right, p)
     if not runs:
-        notes.append("no line runs detected; keeping full page")
         return PageMargins(0, W, H, 0, H - 1, keep_left_default, keep_right_default,
                            None, None, None, notes)
 
     edge_band = max(3, int(0.012 * H))
-    def _is_edge_artifact(a: int, b: int) -> bool:
-        h = b - a + 1
-        touches_top = a <= 2
-        touches_bot = b >= H - 3
-        return (touches_top or touches_bot) and h <= edge_band
-    runs = [r for r in runs if not _is_edge_artifact(r[0], r[1])]
+    runs = [r for r in runs
+            if not ((r[0] <= 2 or r[1] >= H - 3) and (r[1] - r[0] + 1) <= edge_band)]
     if not runs:
-        notes.append("only edge artifacts detected; keeping full page")
         return PageMargins(0, W, H, 0, H - 1, keep_left_default, keep_right_default,
                            None, None, None, notes)
 
@@ -270,33 +252,27 @@ def detect_margins(
         median_gap = gaps[len(gaps) // 2]
     else:
         median_gap = max(8, int(0.012 * H))
-    line_widths = sorted(r[2] for r in runs)
-    median_width = line_widths[len(line_widths) // 2]
+    median_width = sorted(r[2] for r in runs)[len(runs) // 2]
 
-    header_band_end = int(p.header_band_frac * H)
+    header_band_end   = int(p.header_band_frac * H)
     footer_band_start = int((1 - p.footer_band_frac) * H)
 
     header_strip: Optional[tuple[int, int]] = None
     if runs and runs[0][0] <= header_band_end:
         first = runs[0]
         gap_to_next = runs[1][0] - first[1] if len(runs) >= 2 else H
-        is_much_narrower = first[2] < median_width * p.narrow_width_ratio
-        is_short = (first[1] - first[0] + 1) < int(0.04 * H)
-        plausible_gap = gap_to_next >= max(int(0.6 * median_gap), 20)
-        if (is_much_narrower or is_short) and plausible_gap:
+        is_narrow = first[2] < median_width * p.narrow_width_ratio
+        is_short  = (first[1] - first[0] + 1) < int(0.04 * H)
+        if (is_narrow or is_short) and gap_to_next >= max(int(0.6 * median_gap), 20):
             header_strip = (first[0], first[1])
             runs = runs[1:]
 
     rules = _detect_horizontal_rules(bw, left, right, p)
     rule_y: Optional[int] = None
-    body_top = (header_strip[1] if header_strip else runs[0][0] if runs else 0)
+    body_top = header_strip[1] if header_strip else (runs[0][0] if runs else 0)
     min_rule_y = body_top + max(int(0.05 * H), 50)
-    candidate_rules = [r for r in rules if r > min_rule_y]
-    valid_rules = []
-    for r in candidate_rules:
-        lines_above = sum(1 for run in runs if run[1] < r)
-        if lines_above >= 2:
-            valid_rules.append(r)
+    valid_rules = [r for r in rules
+                   if r > min_rule_y and sum(1 for run in runs if run[1] < r) >= 2]
     if valid_rules:
         rule_y = min(valid_rules)
 
@@ -305,54 +281,42 @@ def detect_margins(
         last = runs[-1]
         if last[1] >= footer_band_start:
             gap_from_prev = last[0] - runs[-2][1] if len(runs) >= 2 else H
-            is_much_narrower = last[2] < median_width * p.narrow_width_ratio
-            is_short = (last[1] - last[0] + 1) < int(0.04 * H)
-            plausible_gap = gap_from_prev >= max(int(0.6 * median_gap), 20)
-            if (is_much_narrower or is_short) and plausible_gap:
+            is_narrow = last[2] < median_width * p.narrow_width_ratio
+            is_short  = (last[1] - last[0] + 1) < int(0.04 * H)
+            if (is_narrow or is_short) and gap_from_prev >= max(int(0.6 * median_gap), 20):
                 footer_strip = (last[0], last[1])
                 runs = runs[:-1]
 
-    safety_px = 4
-    rule_safety_px = 12
     body_first_y = runs[0][0] if runs else 0
-    body_last_y = runs[-1][1] if runs else H - 1
+    body_last_y  = runs[-1][1] if runs else H - 1
 
-    top_lower_bound = (header_strip[1] + safety_px) if header_strip else 0
-    keep_top = max(top_lower_bound, body_first_y - p.pad_top_px)
+    keep_top = max(
+        (header_strip[1] + 4) if header_strip else 0,
+        body_first_y - p.pad_top_px,
+    )
 
     if rule_y is not None:
-        bottom_upper_bound = rule_y - rule_safety_px
+        bottom_bound = rule_y - 12
     elif footer_strip is not None:
-        bottom_upper_bound = footer_strip[0] - safety_px
+        bottom_bound = footer_strip[0] - 4
     else:
-        bottom_upper_bound = H - 1
-    keep_bottom = min(bottom_upper_bound, body_last_y + p.pad_bottom_px)
-    keep_bottom = max(keep_top + 1, keep_bottom)
+        bottom_bound = H - 1
+    keep_bottom = max(keep_top + 1, min(bottom_bound, body_last_y + p.pad_bottom_px))
 
     if p.preserve_horizontal:
         keep_left, keep_right = 0, W - 1
     else:
-        keep_left = max(0, left - p.pad_side_px)
+        keep_left  = max(0, left  - p.pad_side_px)
         keep_right = min(W - 1, right + p.pad_side_px)
 
     return PageMargins(
-        page_index=0,
-        page_w=W,
-        page_h=H,
-        keep_top=int(keep_top),
-        keep_bottom=int(keep_bottom),
-        keep_left=int(keep_left),
-        keep_right=int(keep_right),
-        header_strip=header_strip,
-        footer_strip=footer_strip,
-        rule_y=rule_y,
-        notes=notes,
+        page_index=0, page_w=W, page_h=H,
+        keep_top=int(keep_top), keep_bottom=int(keep_bottom),
+        keep_left=int(keep_left), keep_right=int(keep_right),
+        header_strip=header_strip, footer_strip=footer_strip,
+        rule_y=rule_y, notes=notes,
     )
 
-
-# ---------------------------------------------------------------------------
-# Public API: process a whole PDF
-# ---------------------------------------------------------------------------
 
 def strip_pdf(
     in_path: str | Path,
@@ -362,9 +326,7 @@ def strip_pdf(
     *,
     verbose: bool = False,
 ) -> list[PageMargins]:
-    """Crop headers & footers from every page of `in_path` and write `out_path`."""
-    in_path = Path(in_path)
-    out_path = Path(out_path)
+    in_path, out_path = Path(in_path), Path(out_path)
     src = fitz.open(in_path)
     results: list[PageMargins] = []
 
@@ -374,13 +336,13 @@ def strip_pdf(
             m.page_index = i
             results.append(m)
             scale = 72.0 / p.dpi
-            page_rect = page.rect
-            x0 = page_rect.x0 + m.keep_left * scale
-            x1 = page_rect.x0 + (m.keep_right + 1) * scale
-            y0 = page_rect.y0 + m.keep_top * scale
-            y1 = page_rect.y0 + (m.keep_bottom + 1) * scale
-            crop = fitz.Rect(x0, y0, x1, y1)
-            crop &= page_rect
+            pr = page.rect
+            crop = fitz.Rect(
+                pr.x0 + m.keep_left * scale,
+                pr.y0 + m.keep_top * scale,
+                pr.x0 + (m.keep_right + 1) * scale,
+                pr.y0 + (m.keep_bottom + 1) * scale,
+            ) & pr
             page.set_cropbox(crop)
         src.save(out_path, garbage=4, deflate=True)
         src.close()
@@ -393,16 +355,13 @@ def strip_pdf(
             m.page_index = i
             results.append(m)
             gray = _render_gray(page, p.dpi)
-            cropped = gray[m.keep_top : m.keep_bottom + 1, m.keep_left : m.keep_right + 1]
-            ok, buf = cv2.imencode(".png", cropped)
+            crop = gray[m.keep_top : m.keep_bottom + 1, m.keep_left : m.keep_right + 1]
+            ok, buf = cv2.imencode(".png", crop)
             if not ok:
                 raise RuntimeError(f"PNG encode failed on page {i}")
-            png_bytes = buf.tobytes()
-            h, w = cropped.shape
-            pt_w = w * 72.0 / p.dpi
-            pt_h = h * 72.0 / p.dpi
-            new_page = out.new_page(width=pt_w, height=pt_h)
-            new_page.insert_image(new_page.rect, stream=png_bytes)
+            h, w = crop.shape
+            new_page = out.new_page(width=w * 72.0 / p.dpi, height=h * 72.0 / p.dpi)
+            new_page.insert_image(new_page.rect, stream=buf.tobytes())
         out.save(out_path, garbage=4, deflate=True)
         out.close()
         src.close()
