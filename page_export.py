@@ -123,6 +123,7 @@ def extract_footers_pdf(
     images_dpi: int = 400,
     images_fmt: str = "png",
     zip_path: Optional[str | Path] = None,
+    on_page=None,
 ) -> list[int]:
     """Assemble all detected footer regions from `src_pdf` into `out_pdf`.
 
@@ -138,6 +139,7 @@ def extract_footers_pdf(
     src_pdf = Path(src_pdf)
     out_pdf = Path(out_pdf)
     src = fitz.open(src_pdf)
+    n = src.page_count
     out = fitz.open()
     contributed: list[int] = []
 
@@ -181,6 +183,8 @@ def extract_footers_pdf(
         new_page = out.new_page(width=cw * 72.0 / p.dpi, height=ch * 72.0 / p.dpi)
         new_page.insert_image(new_page.rect, stream=buf.tobytes())
         contributed.append(i + 1)
+        if on_page:
+            on_page(i + 1, n)
 
         # Save standalone footer image.
         if _save_imgs:
