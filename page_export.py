@@ -139,7 +139,7 @@ def extract_footers_pdf(
     src_pdf = Path(src_pdf)
     out_pdf = Path(out_pdf)
     src = fitz.open(src_pdf)
-    n = src.page_count
+    total_pages = src.page_count
     out = fitz.open()
     contributed: list[int] = []
 
@@ -184,7 +184,7 @@ def extract_footers_pdf(
         new_page.insert_image(new_page.rect, stream=buf.tobytes())
         contributed.append(i + 1)
         if on_page:
-            on_page(i + 1, n)
+            on_page(i + 1, total_pages)
 
         # Save standalone footer image.
         if _save_imgs:
