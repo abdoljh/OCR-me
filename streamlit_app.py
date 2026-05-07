@@ -457,6 +457,52 @@ def _stream_pages_to_zips(
 # Per-mode UI renderers
 # ---------------------------------------------------------------------------
 
+def _render_download_selector(
+    files: list[dict],
+    file_hash: str,
+    key_prefix: str,
+) -> None:
+    """One download button at a time, gated by a selectbox.
+
+    Streamlit stores each download_button's data in session memory for the
+    lifetime of the render.  Loading all files simultaneously (e.g. 5 × 250 MB)
+    exceeds Streamlit Cloud's 1 GB RAM limit.  This function shows only the
+    currently-selected file's button, bounding peak memory to ≤ one file.
+
+    files: list of {"path": str, "mime": str}
+    """
+    valid = [f for f in files if Path(f["path"]).exists()]
+    if not valid:
+        st.warning("Download files are no longer available. Please reset and re-run.")
+        return
+
+    labels = [
+        f"{Path(f['path']).name}  ({Path(f['path']).stat().st_size / 1_048_576:.0f} MB)"
+        for f in valid
+    ]
+
+    sel = st.selectbox(
+        "Select file:",
+        range(len(valid)),
+        format_func=lambda i: labels[i],
+        key=f"{key_prefix}_sel_{file_hash}",
+    )
+
+    f = valid[sel]
+    fname = Path(f["path"]).name
+    with open(f["path"], "rb") as fh:
+        st.download_button(
+            f"⬇ {fname}",
+            data=fh.read(),
+            file_name=fname,
+            mime=f["mime"],
+            key=f"{key_prefix}_dl_{file_hash}_{sel}",
+            use_container_width=True,
+        )
+    if len(valid) > 1:
+        st.caption(f"File {sel + 1} of {len(valid)} — use the selector above to switch.")
+
+
 def _do_single_book(
     pdf_bytes: bytes,
     dpi: int,
@@ -587,42 +633,13 @@ def _render_single_book_ui(
             icon="✅",
         )
 
-        for i, zip_path in enumerate(result["page_zips"]):
-            zip_name = Path(zip_path).name
-            with open(zip_path, "rb") as fh:
-                st.download_button(
-                    f"⬇ {zip_name}",
-                    data=fh.read(),
-                    file_name=zip_name,
-                    mime="application/zip",
-                    key=f"sb_zip_{file_hash}_{i}",
-                    use_container_width=True,
-                )
-
-        if result.get("footers_pdf") or result.get("footers_zip"):
-            st.markdown("**Footnote regions:**")
-            foot_cols = st.columns(2)
-            if result.get("footers_pdf") and Path(result["footers_pdf"]).exists():
-                with open(result["footers_pdf"], "rb") as fh:
-                    foot_cols[0].download_button(
-                        "⬇ Footers PDF",
-                        data=fh.read(),
-                        file_name=f"{stem}_footers.pdf",
-                        mime="application/pdf",
-                        key=f"sb_footpdf_{file_hash}",
-                        use_container_width=True,
-                    )
-            if result.get("footers_zip") and Path(result["footers_zip"]).exists():
-                with open(result["footers_zip"], "rb") as fh:
-                    foot_cols[1].download_button(
-                        "⬇ Footer Images ZIP",
-                        data=fh.read(),
-                        file_name=f"{stem}_footers_imgs.zip",
-                        mime="application/zip",
-                        key=f"sb_footzip_{file_hash}",
-                        use_container_width=True,
-                    )
-        elif cfg["include_footers"] and not n_foot:
+        dl_files = [{"path": zp, "mime": "application/zip"} for zp in result["page_zips"]]
+        if result.get("footers_pdf"):
+            dl_files.append({"path": result["footers_pdf"], "mime": "application/pdf"})
+        if result.get("footers_zip"):
+            dl_files.append({"path": result["footers_zip"], "mime": "application/zip"})
+        _render_download_selector(dl_files, file_hash, "sb")
+        if cfg["include_footers"] and not n_foot:
             st.info("No footnote sections were detected in this document.")
 
         if st.button("↺ Reset", key=f"sb_reset_{file_hash}"):
@@ -713,17 +730,10 @@ def _render_raw_export_ui(
             icon="✅",
         )
 
-        for i, zip_path in enumerate(result["zip_paths"]):
-            zip_name = Path(zip_path).name
-            with open(zip_path, "rb") as fh:
-                st.download_button(
-                    f"⬇ {zip_name}",
-                    data=fh.read(),
-                    file_name=zip_name,
-                    mime="application/zip",
-                    key=f"re_zip_{file_hash}_{i}",
-                    use_container_width=True,
-                )
+        _render_download_selector(
+            [{"path": zp, "mime": "application/zip"} for zp in result["zip_paths"]],
+            file_hash, "re",
+        )
 
         if st.button("↺ Reset", key=f"re_reset_{file_hash}"):
             tmpdir = st.session_state.pop(tmpdir_key, None)
