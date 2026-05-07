@@ -325,9 +325,11 @@ def strip_pdf(
     mode: str = "cropbox",
     *,
     verbose: bool = False,
+    on_page=None,
 ) -> list[PageMargins]:
     in_path, out_path = Path(in_path), Path(out_path)
     src = fitz.open(in_path)
+    n = src.page_count
     results: list[PageMargins] = []
 
     if mode == "cropbox":
@@ -344,6 +346,8 @@ def strip_pdf(
                 pr.y0 + (m.keep_bottom + 1) * scale,
             ) & pr
             page.set_cropbox(crop)
+            if on_page:
+                on_page(i + 1, n)
         src.save(out_path, garbage=4, deflate=True)
         src.close()
         return results
@@ -362,6 +366,8 @@ def strip_pdf(
             h, w = crop.shape
             new_page = out.new_page(width=w * 72.0 / p.dpi, height=h * 72.0 / p.dpi)
             new_page.insert_image(new_page.rect, stream=buf.tobytes())
+            if on_page:
+                on_page(i + 1, n)
         out.save(out_path, garbage=4, deflate=True)
         out.close()
         src.close()

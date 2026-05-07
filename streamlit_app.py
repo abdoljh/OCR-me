@@ -533,23 +533,34 @@ def _do_single_book(
 
     with st.status("Processing…", expanded=True) as status:
         st.write(f"⚙️ Detecting and stripping margins on {total} page(s)…")
-        strip_pdf(str(src_path), str(strip_path), p)
+        prog1 = st.progress(0)
+
+        def _on_strip(pg: int, n: int) -> None:
+            prog1.progress(pg / n, text=f"Page {pg} of {n}")
+
+        strip_pdf(str(src_path), str(strip_path), p, on_page=_on_strip)
+        prog1.empty()
 
         st.write(f"🖼 Rendering {total} page(s) at {dpi} DPI…")
-        prog = st.progress(0)
+        prog2 = st.progress(0)
 
         def _on_page(pg: int, n: int) -> None:
-            prog.progress(pg / n, text=f"Page {pg} of {n}")
+            prog2.progress(pg / n, text=f"Page {pg} of {n}")
 
         page_zips = _stream_pages_to_zips(
             str(strip_path), split_dir, stem, zip_split_mb, dpi, _on_page
         )
-        prog.empty()
+        prog2.empty()
 
         foot_pages: list[int] = []
         footers_zip_path: str | None = None
         if include_footers:
             st.write("📑 Extracting footnote regions…")
+            prog3 = st.progress(0)
+
+            def _on_foot(pg: int, n: int) -> None:
+                prog3.progress(pg / n, text=f"Page {pg} of {n}")
+
             foot_img_dir = tmpdir / "footer_imgs"
             fzip = tmpdir / f"{stem}_footers_imgs.zip"
             foot_pages = extract_footers_pdf(
@@ -557,7 +568,9 @@ def _do_single_book(
                 img_dir=str(foot_img_dir),
                 images_dpi=dpi,
                 zip_path=str(fzip),
+                on_page=_on_foot,
             )
+            prog3.empty()
             if foot_pages and fzip.exists():
                 footers_zip_path = str(fzip)
 
