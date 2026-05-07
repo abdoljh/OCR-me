@@ -5,10 +5,13 @@ Companion utilities for header_footer.py.
    Render each page of a stripped PDF (CropBox already set) to PNG/TIF/JPG,
    optionally zipping the results.
 
-2. extract_footers_pdf(src_pdf, out_pdf, p=Params())
+2. extract_footers_pdf(src_pdf, out_pdf, p=Params(), ...)
    Re-detect each page's footer in the ORIGINAL uncropped PDF and assemble a
    single PDF where each output page shows one source footer with a page label.
    Pages without a detected footer are skipped.
+
+   v2 additions: img_dir, images_dpi, images_fmt, zip_path — save standalone
+   footer images at a configurable DPI and optionally zip them.
 """
 
 from __future__ import annotations
@@ -116,17 +119,35 @@ def extract_footers_pdf(
     p: Params = Params(),
     label_dpi_px: int = 48,
     label_margin_px: int = 24,
+    img_dir: Optional[str | Path] = None,
+    images_dpi: int = 400,
+    images_fmt: str = "png",
+    zip_path: Optional[str | Path] = None,
 ) -> list[int]:
     """Assemble all detected footer regions from `src_pdf` into `out_pdf`.
 
     Each output page shows one footer prefixed by a label ("Page N — file.pdf").
     Returns the 1-based page numbers of source pages that contributed a footer.
+
+    Optional standalone image export:
+      img_dir    — directory to write per-footer images (created if needed).
+      images_dpi — DPI for standalone images (re-rendered if != p.dpi).
+      images_fmt — "png", "jpg", or "tif".
+      zip_path   — if given, zip all standalone images here.
     """
     src_pdf = Path(src_pdf)
     out_pdf = Path(out_pdf)
     src = fitz.open(src_pdf)
     out = fitz.open()
     contributed: list[int] = []
+
+    _save_imgs = img_dir is not None
+    img_paths: list[Path] = []
+    fmt = images_fmt.lower().lstrip(".")
+    ext = ".tif" if fmt in {"tif", "tiff"} else (".jpg" if fmt in {"jpg", "jpeg"} else ".png")
+    if _save_imgs:
+        img_dir = Path(img_dir)
+        img_dir.mkdir(parents=True, exist_ok=True)
 
     for i, page in enumerate(src):
         m = detect_margins(page, p, verbose=False)
@@ -140,7 +161,7 @@ def extract_footers_pdf(
         footer_img = gray[y0 : y1 + 1, :]
         h_strip, w_strip = footer_img.shape[:2]
 
-        # Label band.
+        # Label band for the PDF.
         label_h = label_dpi_px + 2 * label_margin_px
         label = np.full((label_h, w_strip), 255, dtype=np.uint8)
         cv2.putText(
@@ -161,9 +182,40 @@ def extract_footers_pdf(
         new_page.insert_image(new_page.rect, stream=buf.tobytes())
         contributed.append(i + 1)
 
+        # Save standalone footer image.
+        if _save_imgs:
+            n = len(contributed)
+            img_path = img_dir / f"footer_{n:04d}_pg{i + 1}{ext}"
+            if images_dpi != p.dpi:
+                hi_gray = _render_gray(page, images_dpi)
+                scale = images_dpi / p.dpi
+                hi_y0 = max(0, int(round(y0 * scale)))
+                hi_y1 = min(hi_gray.shape[0] - 1, int(round(y1 * scale)))
+                save_img = hi_gray[hi_y0 : hi_y1 + 1, :]
+            else:
+                save_img = footer_img
+            if ext == ".png":
+                cv2.imwrite(str(img_path), save_img)
+            else:
+                save_bgr = (
+                    cv2.cvtColor(save_img, cv2.COLOR_GRAY2BGR)
+                    if save_img.ndim == 2 else save_img
+                )
+                jparams: list[int] = [int(cv2.IMWRITE_JPEG_QUALITY), 95] if ext == ".jpg" else []
+                cv2.imwrite(str(img_path), save_bgr, jparams)
+            img_paths.append(img_path)
+
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     if out.page_count > 0:
         out.save(out_pdf, garbage=4, deflate=True)
     out.close()
     src.close()
+
+    if zip_path is not None and img_paths:
+        zip_path = Path(zip_path)
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for img in img_paths:
+                zf.write(img, arcname=img.name)
+
     return contributed

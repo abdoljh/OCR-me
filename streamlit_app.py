@@ -1,11 +1,13 @@
 import io
 import hashlib
+import math
 import os
 import shutil
 import tempfile
 import urllib.request
 import warnings
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
@@ -15,6 +17,7 @@ from pdf2image import convert_from_bytes
 DEFAULT_DPI = 400
 MIN_DPI = 150
 MAX_DPI = 600
+ZIP_SPLIT_DEFAULT_MB = 250
 
 _MODEL_URL = (
     "https://raw.githubusercontent.com/OpenITI/AOCP_print_models"
@@ -22,7 +25,6 @@ _MODEL_URL = (
 )
 _MODEL_PATH = os.path.expanduser("~/.kraken_models/apt-20221130.mlmodel")
 
-# Maps the UI bidi selection string to the value rpred expects.
 _BIDI_OPTIONS = {
     "Auto — let kraken decide (True)": "auto",
     "Force RTL — override to right-to-left ('R')": "R",
@@ -30,8 +32,7 @@ _BIDI_OPTIONS = {
     "Off — raw display order (False)": "off",
 }
 _BIDI_TO_RPRED = {"auto": True, "R": "R", "L": "L", "off": False}
-# Reverse map: internal key → short display name for the config JSON snapshot.
-_BIDI_SHORT = {v: k.split(" —")[0] for k, v in _BIDI_OPTIONS.items()}
+_BIDI_SHORT    = {v: k.split(" —")[0] for k, v in _BIDI_OPTIONS.items()}
 
 
 def get_file_hash(data: bytes) -> str:
@@ -97,27 +98,24 @@ def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
     """Scan horizontal ink density to locate header/footer boundaries.
 
     Returns (top_crop_px, bot_crop_px): pixels to remove from each edge.
-    Works by finding the first significant gap between the header ink-block
-    and the body, and the last such gap between the body and the footer.
-    Returns (0, 0) when no clear header/footer gap is detected.
     """
     img = Image.open(io.BytesIO(bw_bytes)).convert("L")
     arr = np.array(img)
     h, w = arr.shape
 
-    ink = (arr < 128).mean(axis=1)                    # ink fraction per row
-    smooth = np.convolve(ink, np.ones(5) / 5, mode="same")  # 5-row smoother
+    ink = (arr < 128).mean(axis=1)
+    smooth = np.convolve(ink, np.ones(5) / 5, mode="same")
 
-    INK_ROW  = 0.004   # row is "inky" if > 0.4 % of width is dark
-    GAP_ROWS = 20      # gap must span >= 20 blank rows
-    ZONE     = h // 3  # only search in the top/bottom 33 %
+    INK_ROW  = 0.004
+    GAP_ROWS = 20
+    ZONE     = h // 3
 
     def _gap_from_top(profile, end):
         in_ink = blank = 0
         for i in range(end):
             if profile[i] > INK_ROW:
                 if in_ink and blank >= GAP_ROWS:
-                    return i        # first body row after the header gap
+                    return i
                 blank = 0
                 in_ink = 1
             elif in_ink:
@@ -129,7 +127,7 @@ def _detect_margins(bw_bytes: bytes) -> tuple[int, int]:
         for i in range(h - 1, start - 1, -1):
             if profile[i] > INK_ROW:
                 if in_ink and blank >= GAP_ROWS:
-                    return h - i - 1    # rows to remove from bottom
+                    return h - i - 1
                 blank = 0
                 in_ink = 1
             elif in_ink:
@@ -144,8 +142,6 @@ def _detect_margins_v2(pdf_bytes: bytes, page_num: int, dpi: int) -> tuple[int, 
     """Smart per-page header/footer detection using header_footer.py.
 
     Returns (top_crop_px, bot_crop_px, page_h, page_w) at `dpi`.
-    top_crop_px: pixels to remove from the top.
-    bot_crop_px: pixels to remove from the bottom.
     """
     import fitz
     from header_footer import detect_margins, Params
@@ -179,7 +175,7 @@ def _draw_crop_overlay(orig_bytes: bytes, top_px: int, bot_px: int) -> bytes:
     img = Image.open(io.BytesIO(orig_bytes)).convert("RGB")
     w, h = img.size
     draw = ImageDraw.Draw(img)
-    lw    = max(4, h // 300)          # line width scales with image height
+    lw    = max(4, h // 300)
     top_y = max(0, min(top_px, h - 1))
     bot_y = max(top_y + 1, h - max(0, bot_px))
     red   = (220, 30, 30)
@@ -202,25 +198,15 @@ def _ocr_page(
     no_legacy_polygons: bool = False,
     temperature: float = 1.0,
 ) -> tuple[str, list[float]]:
-    """Full kraken pipeline: binarize -> segment -> ocr.
-
-    Prefers the kraken CLI (the exact pipeline from the documentation):
-        kraken -i page.png out.txt binarize segment ocr -m model.mlmodel
-    Falls back to the Python API when the CLI is not on PATH (dev environments).
-
-    orig_bytes: original colour/grey page render -- the CLI binarises this itself;
-                the Python-API fallback also binarises internally before segmenting.
-    """
+    """Full kraken pipeline: binarize -> segment -> ocr."""
     import shutil, subprocess, sys, tempfile
 
-    # -- Locate the kraken CLI -------------------------------------------------
-    # When installed via pip the script lives next to the Python executable.
     kraken_bin = shutil.which("kraken") or os.path.join(
         os.path.dirname(sys.executable), "kraken"
     )
     use_cli = bool(kraken_bin) and os.path.isfile(kraken_bin)
 
-    cli_stderr = ""   # captured for the fallback warning
+    cli_stderr = ""
 
     if use_cli:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -238,7 +224,7 @@ def _ocr_page(
                 cmd.append("--no-reorder")
             elif bidi_key == "L":
                 cmd += ["--base-dir", "L", "--reorder"]
-            else:  # "R" or "auto"
+            else:
                 cmd += ["--base-dir", "R", "--reorder"]
             if no_legacy_polygons:
                 cmd.append("--no-legacy-polygons")
@@ -301,12 +287,7 @@ def _anthropic_key() -> str:
 
 @st.cache_data(show_spinner=False)
 def _ocr_page_claude(orig_bytes: bytes) -> tuple[str, list[float]]:
-    """Extract Arabic text from a page image using Claude Haiku vision.
-
-    Uses claude-haiku-4-5-20251001.  Handles both modern printed Arabic and
-    Quranic Uthmanic script.  Requires ANTHROPIC_API_KEY in Streamlit secrets
-    or the environment.  Cost: ~$0.004 per page at 400 DPI.
-    """
+    """Extract Arabic text from a page image using Claude Haiku vision."""
     import anthropic
     import base64
 
@@ -360,8 +341,6 @@ def _build_txt(texts: tuple[str, ...], stem: str) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def _build_pdf(png_paths: tuple[str, ...], dpi: int) -> bytes:
-    # Grayscale + half-size: reduces peak RAM ~12x vs full-colour originals.
-    # At 400 DPI source, the PDF is effectively 200 DPI -- adequate for reading.
     images = []
     for path in png_paths:
         img = Image.open(path).convert("L")
@@ -396,237 +375,773 @@ def _build_zip(png_paths: tuple[str, ...], stem: str) -> bytes:
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner=False)
-def _batch_export(pdf_bytes: bytes, dpi: int) -> tuple[bytes, bytes]:
-    """Full auto-detect pipeline in one call.
+# ---------------------------------------------------------------------------
+# Disk-based pipeline helpers (no @st.cache_data — side effects + large output)
+# ---------------------------------------------------------------------------
 
-    1. Strip headers/footers (CropBox, lossless) via header_footer.detect_margins.
-    2. Render each stripped page to a colour PNG at `dpi` and zip them.
-    3. Extract footer regions from the original into a labeled PDF.
+def _estimate_pages_mb(n_pages: int, dpi: int) -> float:
+    """Estimate uncompressed PNG size: ~4 MB/page at 400 DPI, scales with DPI²."""
+    return n_pages * 4.0 * (dpi / 400) ** 2
 
-    Returns (zip_bytes, footers_pdf_bytes).
-    footers_pdf_bytes is b"" when no footers are detected.
+
+def _split_images_to_zips(
+    img_dir: Path,
+    split_dir: Path,
+    stem: str,
+    max_mb: float,
+) -> list[str]:
+    """Group sorted images in `img_dir` into ZIPs of at most `max_mb` MB each.
+
+    Single-chunk output keeps a clean name (`{stem}_pages.zip`).
+    Multi-chunk output uses `{stem}_pages_part_001.zip`, etc.
+    Returns list of written ZIP paths.
+    """
+    split_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(img_dir.iterdir())
+    if not files:
+        return []
+
+    max_bytes = max_mb * 1024 * 1024
+    chunks: list[list[Path]] = []
+    cur_chunk: list[Path] = []
+    cur_size = 0
+
+    for f in files:
+        fsize = f.stat().st_size
+        if cur_chunk and cur_size + fsize > max_bytes:
+            chunks.append(cur_chunk)
+            cur_chunk = []
+            cur_size = 0
+        cur_chunk.append(f)
+        cur_size += fsize
+    if cur_chunk:
+        chunks.append(cur_chunk)
+
+    zip_paths: list[str] = []
+    if len(chunks) == 1:
+        zip_path = split_dir / f"{stem}_pages.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in chunks[0]:
+                zf.write(f, arcname=f.name)
+        zip_paths.append(str(zip_path))
+    else:
+        for idx, chunk in enumerate(chunks, 1):
+            zip_path = split_dir / f"{stem}_pages_part_{idx:03d}.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in chunk:
+                    zf.write(f, arcname=f.name)
+            zip_paths.append(str(zip_path))
+
+    return zip_paths
+
+
+def _run_single_book(
+    pdf_bytes: bytes,
+    dpi: int,
+    include_footers: bool,
+    zip_split_mb: float,
+    tmpdir: str,
+    stem: str,
+) -> dict:
+    """Auto-detect pipeline: strip headers/footers, export pages, optionally extract footers.
+
+    Returns a dict with:
+      page_zips          — list of ZIP file paths (may be >1 if split)
+      footers_pdf        — path to labeled footers PDF, or None
+      footers_zip        — path to footer images ZIP, or None
+      n_pages_with_footers — int
     """
     from header_footer import strip_pdf, Params
     from page_export import export_pages_as_images, extract_footers_pdf
 
     p = Params(dpi=dpi)
-    with tempfile.TemporaryDirectory(prefix="ocr_batch_") as tmpdir:
-        src_path   = os.path.join(tmpdir, "input.pdf")
-        strip_path = os.path.join(tmpdir, "stripped.pdf")
-        img_dir    = os.path.join(tmpdir, "pages")
-        zip_path   = os.path.join(tmpdir, "pages.zip")
-        foot_path  = os.path.join(tmpdir, "footers.pdf")
+    td = Path(tmpdir)
 
-        with open(src_path, "wb") as f:
-            f.write(pdf_bytes)
+    src_path   = td / "input.pdf"
+    strip_path = td / "stripped.pdf"
+    img_dir    = td / "pages"
+    split_dir  = td / "zips"
+    foot_path  = td / "footers.pdf"
 
-        strip_pdf(src_path, strip_path, p)
-        export_pages_as_images(strip_path, img_dir, dpi=dpi, zip_path=zip_path)
-        contributed = extract_footers_pdf(src_path, foot_path, p=p)
+    src_path.write_bytes(pdf_bytes)
+    strip_pdf(str(src_path), str(strip_path), p)
+    export_pages_as_images(str(strip_path), str(img_dir), dpi=dpi)
 
-        with open(zip_path, "rb") as f:
-            zip_bytes = f.read()
+    page_zips = _split_images_to_zips(img_dir, split_dir, stem, zip_split_mb)
 
-        foot_bytes = b""
-        if contributed and os.path.exists(foot_path):
-            with open(foot_path, "rb") as f:
-                foot_bytes = f.read()
+    # Free disk space used by individual PNGs after zipping.
+    for f in sorted(img_dir.iterdir()):
+        f.unlink()
 
-    return zip_bytes, foot_bytes
+    foot_pages: list[int] = []
+    footers_zip_path: str | None = None
+    if include_footers:
+        foot_img_dir = td / "footer_imgs"
+        fzip = td / f"{stem}_footers_imgs.zip"
+        foot_pages = extract_footers_pdf(
+            str(src_path), str(foot_path), p=p,
+            img_dir=str(foot_img_dir),
+            images_dpi=dpi,
+            zip_path=str(fzip),
+        )
+        if foot_pages and fzip.exists():
+            footers_zip_path = str(fzip)
 
+    return {
+        "page_zips": page_zips,
+        "footers_pdf": str(foot_path) if include_footers and foot_pages and foot_path.exists() else None,
+        "footers_zip": footers_zip_path,
+        "n_pages_with_footers": len(foot_pages),
+    }
+
+
+def _run_raw_export(
+    pdf_bytes: bytes,
+    dpi: int,
+    zip_split_mb: float,
+    tmpdir: str,
+    stem: str,
+) -> list[str]:
+    """Export original (un-stripped) pages as colour images, split into ZIPs."""
+    from page_export import export_pages_as_images
+
+    td = Path(tmpdir)
+    src_path  = td / "input.pdf"
+    img_dir   = td / "pages"
+    split_dir = td / "zips"
+
+    src_path.write_bytes(pdf_bytes)
+    export_pages_as_images(str(src_path), str(img_dir), dpi=dpi)
+
+    zip_paths = _split_images_to_zips(img_dir, split_dir, stem, zip_split_mb)
+
+    for f in sorted(img_dir.iterdir()):
+        f.unlink()
+
+    return zip_paths
+
+
+# ---------------------------------------------------------------------------
+# Per-mode UI renderers
+# ---------------------------------------------------------------------------
+
+def _render_single_book_ui(
+    pdf_bytes: bytes, file_hash: str, stem: str, total: int, cfg: dict,
+) -> None:
+    result_key = f"sb_result_{file_hash}"
+    tmpdir_key = f"sb_tmpdir_{file_hash}"
+
+    if result_key not in st.session_state:
+        est_mb = _estimate_pages_mb(total, cfg["dpi"])
+        n_parts = max(1, math.ceil(est_mb / cfg["zip_split_mb"]))
+        parts_note = f" → {n_parts} ZIP part{'s' if n_parts > 1 else ''}" if n_parts > 1 else ""
+        st.caption(
+            f"{total} page(s) · ~{est_mb:.0f} MB estimated at {cfg['dpi']} DPI{parts_note}"
+        )
+
+        col_btn, col_info = st.columns([1, 4])
+        run_clicked = col_btn.button(
+            "▶ Run",
+            key=f"sb_run_{file_hash}",
+            type="primary",
+            use_container_width=True,
+        )
+        col_info.caption(
+            "Strips headers/footers automatically and exports all pages as colour PNGs."
+            + (" Extracts footer regions too." if cfg["include_footers"] else "")
+        )
+
+        if run_clicked:
+            tmpdir = tempfile.mkdtemp(prefix="sb_")
+            st.session_state[tmpdir_key] = tmpdir
+            with st.spinner(f"Processing {total} page(s) at {cfg['dpi']} DPI…"):
+                result = _run_single_book(
+                    pdf_bytes,
+                    cfg["dpi"],
+                    cfg["include_footers"],
+                    cfg["zip_split_mb"],
+                    tmpdir,
+                    stem,
+                )
+            st.session_state[result_key] = result
+            st.rerun()
+    else:
+        result = st.session_state[result_key]
+        n_zips = len(result["page_zips"])
+        n_foot = result["n_pages_with_footers"]
+        st.success(
+            f"Done — {total} page(s) processed"
+            + (f", {n_zips} ZIP part{'s' if n_zips > 1 else ''}" if n_zips else "")
+            + (f", {n_foot} page(s) with footnotes." if cfg["include_footers"] else "."),
+            icon="✅",
+        )
+
+        for i, zip_path in enumerate(result["page_zips"]):
+            zip_name = Path(zip_path).name
+            with open(zip_path, "rb") as fh:
+                st.download_button(
+                    f"⬇ {zip_name}",
+                    data=fh.read(),
+                    file_name=zip_name,
+                    mime="application/zip",
+                    key=f"sb_zip_{file_hash}_{i}",
+                    use_container_width=True,
+                )
+
+        if result.get("footers_pdf") or result.get("footers_zip"):
+            st.markdown("**Footnote regions:**")
+            foot_cols = st.columns(2)
+            if result.get("footers_pdf") and Path(result["footers_pdf"]).exists():
+                with open(result["footers_pdf"], "rb") as fh:
+                    foot_cols[0].download_button(
+                        "⬇ Footers PDF",
+                        data=fh.read(),
+                        file_name=f"{stem}_footers.pdf",
+                        mime="application/pdf",
+                        key=f"sb_footpdf_{file_hash}",
+                        use_container_width=True,
+                    )
+            if result.get("footers_zip") and Path(result["footers_zip"]).exists():
+                with open(result["footers_zip"], "rb") as fh:
+                    foot_cols[1].download_button(
+                        "⬇ Footer Images ZIP",
+                        data=fh.read(),
+                        file_name=f"{stem}_footers_imgs.zip",
+                        mime="application/zip",
+                        key=f"sb_footzip_{file_hash}",
+                        use_container_width=True,
+                    )
+        elif cfg["include_footers"] and not n_foot:
+            st.info("No footnote sections were detected in this document.")
+
+        if st.button("↺ Reset", key=f"sb_reset_{file_hash}"):
+            tmpdir = st.session_state.pop(tmpdir_key, None)
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            st.session_state.pop(result_key, None)
+            st.rerun()
+
+
+def _render_raw_export_ui(
+    pdf_bytes: bytes, file_hash: str, stem: str, total: int, cfg: dict,
+) -> None:
+    result_key = f"re_result_{file_hash}"
+    tmpdir_key = f"re_tmpdir_{file_hash}"
+
+    if result_key not in st.session_state:
+        est_mb = _estimate_pages_mb(total, cfg["dpi"])
+        n_parts = max(1, math.ceil(est_mb / cfg["zip_split_mb"]))
+        parts_note = f" → {n_parts} ZIP part{'s' if n_parts > 1 else ''}" if n_parts > 1 else ""
+        st.caption(
+            f"{total} page(s) · ~{est_mb:.0f} MB estimated at {cfg['dpi']} DPI{parts_note}"
+        )
+
+        col_btn, col_info = st.columns([1, 4])
+        run_clicked = col_btn.button(
+            "▶ Run",
+            key=f"re_run_{file_hash}",
+            type="primary",
+            use_container_width=True,
+        )
+        col_info.caption(
+            "Exports all original pages as colour PNG images (no header/footer removal)."
+        )
+
+        if run_clicked:
+            tmpdir = tempfile.mkdtemp(prefix="re_")
+            st.session_state[tmpdir_key] = tmpdir
+            with st.spinner(f"Exporting {total} page(s) at {cfg['dpi']} DPI…"):
+                zip_paths = _run_raw_export(
+                    pdf_bytes,
+                    cfg["dpi"],
+                    cfg["zip_split_mb"],
+                    tmpdir,
+                    stem,
+                )
+            st.session_state[result_key] = {"zip_paths": zip_paths}
+            st.rerun()
+    else:
+        result = st.session_state[result_key]
+        n_zips = len(result["zip_paths"])
+        st.success(
+            f"Done — {total} page(s) exported, {n_zips} ZIP part{'s' if n_zips > 1 else ''}.",
+            icon="✅",
+        )
+
+        for i, zip_path in enumerate(result["zip_paths"]):
+            zip_name = Path(zip_path).name
+            with open(zip_path, "rb") as fh:
+                st.download_button(
+                    f"⬇ {zip_name}",
+                    data=fh.read(),
+                    file_name=zip_name,
+                    mime="application/zip",
+                    key=f"re_zip_{file_hash}_{i}",
+                    use_container_width=True,
+                )
+
+        if st.button("↺ Reset", key=f"re_reset_{file_hash}"):
+            tmpdir = st.session_state.pop(tmpdir_key, None)
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            st.session_state.pop(result_key, None)
+            st.rerun()
+
+
+def _render_visual_ui(
+    pdf_bytes: bytes, file_hash: str, stem: str, total: int, cfg: dict,
+) -> None:
+    # Fast mode: detect from page 1 once per file.
+    det_key = f"crop_det_{file_hash}"
+    if cfg["detect_mode"] == "Fast (page 1)" and det_key not in st.session_state:
+        with st.spinner("Detecting header/footer margins from page 1…"):
+            bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
+            top_px_det, bot_px_det = _detect_margins(bw_p1)
+            h_p1 = Image.open(io.BytesIO(bw_p1)).height
+        st.session_state["_pending_top_crop_pct"] = min(75, round(top_px_det / h_p1 * 100))
+        st.session_state["_pending_bot_crop_pct"] = min(75, round(bot_px_det / h_p1 * 100))
+        st.session_state[det_key] = True
+        st.rerun()
+
+    wiz_page_key = f"wiz_page_{file_hash}"
+    wiz_done_key = f"wiz_done_{file_hash}"
+    if wiz_page_key not in st.session_state:
+        st.session_state[wiz_page_key] = 1
+
+    # =========================================================================
+    # DOWNLOAD VIEW
+    # =========================================================================
+    if st.session_state.get(wiz_done_key, False):
+        tmpdir_key = f"tmpdir_{file_hash}"
+        if tmpdir_key not in st.session_state:
+            st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
+        tmpdir = st.session_state[tmpdir_key]
+
+        all_texts: list[str] = []
+
+        THUMB_COLS = 5
+        thumb_cols: list[list] = []
+        for row_start in range(0, total, THUMB_COLS):
+            n_in_row = min(THUMB_COLS, total - row_start)
+            thumb_cols.append(list(st.columns(n_in_row)))
+
+        prog = st.progress(0, text="Building images…")
+        png_paths: list[str] = []
+
+        for pn in range(1, total + 1):
+            prog.progress(pn / total, text=f"Page {pn} of {total}…")
+            png_path = os.path.join(tmpdir, f"page{pn:03d}.png")
+            png_paths.append(png_path)
+
+            pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
+            pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
+
+            if not os.path.exists(png_path):
+                ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
+                h  = Image.open(io.BytesIO(ob)).height
+                cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h), cfg["pad_px"])
+                with open(png_path, "wb") as fh:
+                    fh.write(cb)
+
+            with open(png_path, "rb") as fh:
+                cb = fh.read()
+
+            col = thumb_cols[(pn - 1) // THUMB_COLS][(pn - 1) % THUMB_COLS]
+            col.image(Image.open(io.BytesIO(cb)), width="stretch",
+                      caption=f"p.{pn}  ↑{pt}% ↓{pb}%")
+            col.download_button(
+                f"↓ p.{pn}",
+                data=cb,
+                file_name=f"{stem}_page{pn:03d}.png",
+                mime="image/png",
+                key=f"dl_thumb_{file_hash}_{pn}",
+            )
+
+            text, confs = "", []
+            if cfg["run_ocr"]:
+                if cfg["engine"] == "claude":
+                    try:
+                        text, confs = _ocr_page_claude(cb)
+                    except Exception:
+                        cfg["engine"] = "kraken"
+                if cfg["engine"] == "kraken":
+                    try:
+                        _load_model()
+                        text, confs = _ocr_page(
+                            cb,
+                            threshold_pct=cfg["threshold_pct"],
+                            text_direction=cfg["text_direction"],
+                            autocast=cfg["autocast"],
+                            pad=cfg["pad"],
+                            bidi_key=cfg["bidi_key"],
+                            no_legacy_polygons=cfg["no_legacy_polygons"],
+                            temperature=cfg["temperature"],
+                        )
+                    except Exception:
+                        pass
+                if cfg["apply_corrections"] and text:
+                    from confusables import apply_word_corrections
+                    text = apply_word_corrections(text, include_gt_derived=True)
+            all_texts.append(text)
+        prog.empty()
+
+        st.markdown("**Download all pages as:**")
+        n_cols = 4 if cfg["run_ocr"] else 3
+        dl_cols = st.columns(n_cols)
+        dl_cols[0].download_button(
+            "PDF",
+            data=_build_pdf(tuple(png_paths), cfg["dpi"]),
+            file_name=f"{stem}_cropped.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key=f"pdf_{file_hash}",
+        )
+        dl_cols[1].download_button(
+            "Multi-page TIFF",
+            data=_build_tiff(tuple(png_paths)),
+            file_name=f"{stem}_cropped.tiff",
+            mime="image/tiff",
+            use_container_width=True,
+            key=f"tiff_{file_hash}",
+        )
+        dl_cols[2].download_button(
+            "ZIP (PNG per page)",
+            data=_build_zip(tuple(png_paths), stem),
+            file_name=f"{stem}_cropped.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key=f"zip_{file_hash}",
+        )
+        if cfg["run_ocr"]:
+            dl_cols[3].download_button(
+                "TXT",
+                data=_build_txt(tuple(all_texts), stem),
+                file_name=f"{stem}.txt",
+                mime="text/plain; charset=utf-8",
+                use_container_width=True,
+                key=f"txt_{file_hash}",
+            )
+
+        st.divider()
+        if st.button("← Back to page editor", key=f"back_{file_hash}"):
+            tmpdir_key2 = f"tmpdir_{file_hash}"
+            if tmpdir_key2 in st.session_state:
+                shutil.rmtree(st.session_state.pop(tmpdir_key2), ignore_errors=True)
+            st.session_state[wiz_done_key] = False
+            st.rerun()
+
+    # =========================================================================
+    # WIZARD VIEW
+    # =========================================================================
+    else:
+        current = st.session_state[wiz_page_key]
+
+        p_top_key = f"p_top_{file_hash}_{current}"
+        p_bot_key = f"p_bot_{file_hash}_{current}"
+        if p_top_key not in st.session_state:
+            if cfg["detect_mode"] == "Smart (per page)":
+                with st.spinner(f"Smart-detecting margins on page {current}…"):
+                    try:
+                        top_px, bot_px, h_det, _ = _detect_margins_v2(
+                            pdf_bytes, current, cfg["dpi"]
+                        )
+                        st.session_state[p_top_key] = min(75, round(top_px / h_det * 100))
+                        st.session_state[p_bot_key] = min(75, round(bot_px / h_det * 100))
+                    except Exception:
+                        st.session_state[p_top_key] = cfg["top_crop_pct"]
+                        st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+            else:
+                st.session_state[p_top_key] = cfg["top_crop_pct"]
+                st.session_state[p_bot_key] = cfg["bot_crop_pct"]
+
+        st.caption(f"**Page {current} of {total}**")
+        sl_left, sl_right = st.columns(2)
+        sl_left.slider(
+            f"Top crop (%) -- page {current}", 0, 75, step=1,
+            key=p_top_key,
+            help="Rows to remove from the top of this page.",
+        )
+        sl_right.slider(
+            f"Bottom crop (%) -- page {current}", 0, 75, step=1,
+            key=p_bot_key,
+            help="Rows to remove from the bottom of this page.",
+        )
+
+        orig_bytes = _render_page_bytes(pdf_bytes, current, cfg["dpi"])
+        h_page   = Image.open(io.BytesIO(orig_bytes)).height
+        page_top = st.session_state[p_top_key]
+        page_bot = st.session_state[p_bot_key]
+        top_px   = round(page_top / 100 * h_page)
+        bot_px   = round(page_bot / 100 * h_page)
+        cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
+
+        tmpdir_key = f"tmpdir_{file_hash}"
+        if tmpdir_key not in st.session_state:
+            st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
+        _wiz_png = os.path.join(st.session_state[tmpdir_key], f"page{current:03d}.png")
+        with open(_wiz_png, "wb") as _fh:
+            _fh.write(cropped_bytes)
+
+        overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
+        col_left, col_right = st.columns(2)
+        col_left.image(overlay_bytes, width="stretch",
+                       caption=f"Page {current} -- crop lines")
+        col_right.image(Image.open(io.BytesIO(cropped_bytes)),
+                        width="stretch",
+                        caption=f"Page {current} -- result")
+        col_right.download_button(
+            f"↓ Page {current} (PNG)",
+            data=cropped_bytes,
+            file_name=f"{stem}_page{current:03d}.png",
+            mime="image/png",
+            key=f"png_{file_hash}_{current}",
+        )
+
+        st.write("")
+        nav_prev, nav_mid, nav_next = st.columns([1, 2, 1])
+        with nav_prev:
+            if st.button("← Prev", disabled=(current == 1),
+                         key=f"prev_{file_hash}", use_container_width=True):
+                st.session_state[wiz_page_key] = current - 1
+                st.rerun()
+        with nav_mid:
+            if st.button(
+                "⬇ Proceed to downloads",
+                key=f"skip_{file_hash}",
+                use_container_width=True,
+                help="Use current crop settings for any un-visited pages and go to downloads.",
+            ):
+                st.session_state[wiz_done_key] = True
+                st.rerun()
+        with nav_next:
+            label = "Next →" if current < total else "✓ Done"
+            btn_type = "secondary" if current < total else "primary"
+            if st.button(label, key=f"next_{file_hash}",
+                         use_container_width=True, type=btn_type):
+                if current < total:
+                    st.session_state[wiz_page_key] = current + 1
+                    st.rerun()
+                else:
+                    st.session_state[wiz_done_key] = True
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
 def _sidebar_settings() -> dict:
     """Render all sidebar controls and return a dict of current values."""
     with st.sidebar:
         st.header("Settings")
 
-        # -- Image quality ----------------------------------------------------
+        mode = st.radio(
+            "Mode",
+            ["Single Book", "Batch", "Raw Export", "Visual"],
+            index=0,
+            key="app_mode",
+            help=(
+                "**Single Book**: Auto-detect & strip headers/footers, export all pages "
+                "as colour images in a ZIP (+ optional footers PDF/ZIP).\n\n"
+                "**Batch**: Same as Single Book — processes every uploaded file.\n\n"
+                "**Raw Export**: Export the original pages as colour images with no "
+                "header/footer removal.\n\n"
+                "**Visual**: Step through pages one-by-one with manual crop sliders "
+                "and optional OCR."
+            ),
+        )
+
         st.subheader("Image quality")
         dpi = st.slider(
             "Rendering DPI", MIN_DPI, MAX_DPI, DEFAULT_DPI, step=50,
             help="Higher DPI = sharper image. 400 DPI is optimal for Apple Live Text.",
         )
 
-        # -- Crop margins -----------------------------------------------------
-        # Slider keys are pre-seeded in main() before this function runs so
-        # there is never a value= / session_state conflict (Streamlit 1.57+).
-        st.subheader("Crop margins")
-        detect_mode = st.radio(
-            "Auto-detect margins",
-            ["Off", "Fast (page 1)", "Smart (per page)"],
-            index=1,
-            key="detect_mode",
-            help=(
-                "**Off**: use the sliders below as-is for all pages.\n\n"
-                "**Fast (page 1)**: scans ink density on page 1 and pre-fills "
-                "the sliders — same crop applied to every page.\n\n"
-                "**Smart (per page)**: uses morphological analysis (OpenCV) to "
-                "detect header, running title, footnote rule, and page-number "
-                "footer independently for each page as you step through the wizard. "
-                "Handles pages where a footnote takes most of the space."
-            ),
-        )
-        top_crop_pct = st.slider(
-            "Top crop (%)", 0, 75, step=1, key="top_crop_pct",
-            help="Percentage of page height removed from the top edge (page-number row, etc.).",
-        )
-        bot_crop_pct = st.slider(
-            "Bottom crop (%)", 0, 75, step=1, key="bot_crop_pct",
-            help="Percentage of page height removed from the bottom edge (footer, running title).",
-        )
-        pad_px = st.slider(
-            "White padding (px)", 0, 50, step=2, key="crop_pad_px",
-            help="White border added around the cropped image.",
-        )
+        # Defaults for options not rendered in the current mode.
+        include_footers = False
+        zip_split_mb    = float(ZIP_SPLIT_DEFAULT_MB)
+        detect_mode     = "Off"
+        top_crop_pct    = 0
+        bot_crop_pct    = 0
+        pad_px          = 20
+        run_ocr         = False
+        engine          = "claude"
+        threshold_pct   = 50
+        text_direction  = "horizontal-rl"
+        autocast        = False
+        pad             = 16
+        bidi_key        = "auto"
+        no_legacy_polygons = False
+        temperature     = 1.0
+        apply_corrections = False
 
-        # -- OCR (optional) ---------------------------------------------------
-        st.subheader("OCR (optional)")
-        run_ocr = st.checkbox(
-            "Extract text as well",
-            value=False,
-            help=(
-                "Run an OCR engine to also produce a .txt file.\n\n"
-                "The primary output is always the cropped colour images. "
-                "OCR adds processing time (and API cost for Claude)."
-            ),
-        )
-
-        # Set defaults for OCR params (used when run_ocr is False).
-        engine = "claude"
-        threshold_pct, text_direction = 50, "horizontal-rl"
-        autocast, pad = False, 16
-        bidi_key = "auto"
-        no_legacy_polygons, temperature, apply_corrections = False, 1.0, False
-
-        if run_ocr:
-            engine_label = st.selectbox(
-                "Engine",
-                ["Claude Haiku (API, ~$0.004/page)", "kraken (offline, free)"],
-                index=0,
+        if mode in ("Single Book", "Batch"):
+            st.subheader("Export options")
+            include_footers = st.checkbox(
+                "Include footers PDF & ZIP",
+                value=True,
+                key="include_footers",
                 help=(
-                    "Claude Haiku: near-perfect Arabic accuracy, handles Quranic "
-                    "Uthmanic script with full tashkeel. Requires ANTHROPIC_API_KEY "
-                    "in Streamlit secrets.\n\n"
-                    "kraken: fully offline, no API key. Good for modern printed "
-                    "Arabic; less reliable on Quranic script and decorative fonts."
+                    "Assemble all detected footnote sections into a labeled PDF "
+                    "and a separate image ZIP."
                 ),
             )
-            engine = "claude" if engine_label.startswith("Claude") else "kraken"
+            zip_split_mb = float(st.number_input(
+                "ZIP split size (MB)",
+                min_value=50, max_value=1000, value=ZIP_SPLIT_DEFAULT_MB, step=50,
+                help="Split the pages ZIP into parts no larger than this.",
+            ))
 
-            if engine == "claude" and not _anthropic_key():
-                st.warning(
-                    "ANTHROPIC_API_KEY not set -- kraken will be used as fallback. "
-                    "Add the key in **Settings -> Secrets** to enable Claude.",
-                    icon="⚠️",
-                )
+        elif mode == "Raw Export":
+            st.subheader("Export options")
+            zip_split_mb = float(st.number_input(
+                "ZIP split size (MB)",
+                min_value=50, max_value=1000, value=ZIP_SPLIT_DEFAULT_MB, step=50,
+                help="Split the pages ZIP into parts no larger than this.",
+            ))
 
-            kraken_label = (
-                "kraken settings (fallback)" if engine == "claude" else "kraken settings"
+        elif mode == "Visual":
+            st.subheader("Crop margins")
+            detect_mode = st.radio(
+                "Auto-detect margins",
+                ["Off", "Fast (page 1)", "Smart (per page)"],
+                index=0,
+                key="detect_mode",
+                help=(
+                    "**Off**: use the sliders below as-is for all pages.\n\n"
+                    "**Fast (page 1)**: scans ink density on page 1 and pre-fills "
+                    "the sliders — same crop applied to every page.\n\n"
+                    "**Smart (per page)**: uses morphological analysis (OpenCV) to "
+                    "detect header, running title, footnote rule, and page-number "
+                    "footer independently for each page. "
+                    "Handles pages where a footnote takes most of the space."
+                ),
             )
-            with st.expander(kraken_label, expanded=(engine == "kraken")):
-                threshold_pct = st.slider(
-                    "Binarization threshold (nlbin)", 10, 90, 50, step=5,
-                    help=(
-                        "nlbin threshold (0.10-0.90). "
-                        "Raise if faint strokes vanish; lower if background noise bleeds in."
-                    ),
-                )
-                text_direction = st.selectbox(
-                    "Text direction",
-                    ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
-                    index=0,
-                    help="Arabic is right-to-left (horizontal-rl).",
-                )
-                autocast = st.checkbox(
-                    "Autocast (mixed precision)", value=False,
-                    help="Enable torch.autocast during segmentation. Usually no effect on CPU.",
-                )
-                pad = st.slider(
-                    "Line padding (px)", 0, 64, 16, step=4,
-                    help="Blank pixels added to each line edge before recognition.",
-                )
-                bidi_label = st.selectbox(
-                    "BiDi reordering", list(_BIDI_OPTIONS.keys()), index=0,
-                    help="Unicode bidi reordering. 'Auto' lets kraken detect per line.",
-                )
-                bidi_key = _BIDI_OPTIONS[bidi_label]
-                no_legacy_polygons = st.checkbox(
-                    "Force new polygon extractor", value=False,
-                    help="May hurt accuracy on older models.",
-                )
-                temperature = st.slider(
-                    "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
-                    help="Affects confidence scores only, not character predictions.",
-                )
+            top_crop_pct = st.slider(
+                "Top crop (%)", 0, 75, step=1, key="top_crop_pct",
+                help="Percentage of page height removed from the top edge.",
+            )
+            bot_crop_pct = st.slider(
+                "Bottom crop (%)", 0, 75, step=1, key="bot_crop_pct",
+                help="Percentage of page height removed from the bottom edge.",
+            )
+            pad_px = st.slider(
+                "White padding (px)", 0, 50, step=2, key="crop_pad_px",
+                help="White border added around the cropped image.",
+            )
 
-            apply_corrections = st.checkbox(
-                "Apply word corrections",
+            st.subheader("OCR (optional)")
+            run_ocr = st.checkbox(
+                "Extract text as well",
                 value=False,
                 help=(
-                    "Run confusables.py substitutions to fix systematic kraken errors "
-                    "(tatweel stripping, فى→في, بنفه→بنفسه …). "
-                    "Claude usually produces these correctly already."
+                    "Run an OCR engine to also produce a .txt file.\n\n"
+                    "The primary output is always the cropped colour images. "
+                    "OCR adds processing time (and API cost for Claude)."
                 ),
             )
 
-        # -- Batch Export -----------------------------------------------------
-        st.subheader("Batch Export")
-        st.caption(
-            "Auto-detect headers/footers, export clean page images as a ZIP, "
-            "and collect footnotes into a separate PDF — all in one step. "
-            "No page-by-page review required."
-        )
-        batch_mode = st.checkbox(
-            "Enable Batch Export",
-            value=False,
-            key="batch_mode",
-            help=(
-                "When enabled, each uploaded file shows a **▶ Run** button that "
-                "processes the whole document automatically using Smart detection:\n\n"
-                "1. Strip headers/footers on every page.\n"
-                "2. Export clean colour page images as a ZIP.\n"
-                "3. Collect all footnote sections into a labeled PDF."
-            ),
-        )
-        batch_include_footers = False
-        if batch_mode:
-            batch_include_footers = st.checkbox(
-                "Include footers PDF",
-                value=True,
-                key="batch_include_footers",
-                help="Assemble all detected footnote regions into a separate labeled PDF.",
-            )
-
-        # -- Active config summary --------------------------------------------
-        with st.expander("Active configuration", expanded=False):
-            cfg_json: dict = {
-                "dpi": dpi,
-                "detect_mode": detect_mode,
-                "top_crop_pct": top_crop_pct,
-                "bot_crop_pct": bot_crop_pct,
-                "pad_px": pad_px,
-                "run_ocr": run_ocr,
-            }
             if run_ocr:
-                cfg_json["engine"] = engine
-                if engine == "claude":
-                    cfg_json["model"] = "claude-haiku-4-5-20251001"
-                else:
-                    cfg_json.update({
-                        "nlbin_threshold": threshold_pct / 100,
-                        "text_direction": text_direction,
-                        "autocast": autocast,
-                        "pad": pad,
-                        "bidi_reordering": _BIDI_SHORT[bidi_key],
-                        "no_legacy_polygons": no_legacy_polygons,
-                        "temperature": temperature,
-                    })
-                cfg_json["apply_corrections"] = apply_corrections
+                engine_label = st.selectbox(
+                    "Engine",
+                    ["Claude Haiku (API, ~$0.004/page)", "kraken (offline, free)"],
+                    index=0,
+                    help=(
+                        "Claude Haiku: near-perfect Arabic accuracy, handles Quranic "
+                        "Uthmanic script with full tashkeel. Requires ANTHROPIC_API_KEY.\n\n"
+                        "kraken: fully offline, no API key needed."
+                    ),
+                )
+                engine = "claude" if engine_label.startswith("Claude") else "kraken"
+
+                if engine == "claude" and not _anthropic_key():
+                    st.warning(
+                        "ANTHROPIC_API_KEY not set -- kraken will be used as fallback. "
+                        "Add the key in **Settings -> Secrets** to enable Claude.",
+                        icon="⚠️",
+                    )
+
+                kraken_label = (
+                    "kraken settings (fallback)" if engine == "claude" else "kraken settings"
+                )
+                with st.expander(kraken_label, expanded=(engine == "kraken")):
+                    threshold_pct = st.slider(
+                        "Binarization threshold (nlbin)", 10, 90, 50, step=5,
+                        help="Raise if faint strokes vanish; lower if noise bleeds in.",
+                    )
+                    text_direction = st.selectbox(
+                        "Text direction",
+                        ["horizontal-rl", "horizontal-lr", "vertical-rl", "vertical-lr"],
+                        index=0,
+                        help="Arabic is right-to-left (horizontal-rl).",
+                    )
+                    autocast = st.checkbox(
+                        "Autocast (mixed precision)", value=False,
+                        help="Enable torch.autocast during segmentation.",
+                    )
+                    pad = st.slider(
+                        "Line padding (px)", 0, 64, 16, step=4,
+                        help="Blank pixels added to each line edge before recognition.",
+                    )
+                    bidi_label = st.selectbox(
+                        "BiDi reordering", list(_BIDI_OPTIONS.keys()), index=0,
+                        help="Unicode bidi reordering. 'Auto' lets kraken detect per line.",
+                    )
+                    bidi_key = _BIDI_OPTIONS[bidi_label]
+                    no_legacy_polygons = st.checkbox(
+                        "Force new polygon extractor", value=False,
+                        help="May hurt accuracy on older models.",
+                    )
+                    temperature = st.slider(
+                        "Softmax temperature", 0.1, 3.0, 1.0, step=0.1,
+                        help="Affects confidence scores only, not character predictions.",
+                    )
+
+                apply_corrections = st.checkbox(
+                    "Apply word corrections",
+                    value=False,
+                    help=(
+                        "Run confusables.py substitutions to fix systematic kraken errors. "
+                        "Claude usually produces these correctly already."
+                    ),
+                )
+
+        with st.expander("Active configuration", expanded=False):
+            cfg_json: dict = {"mode": mode, "dpi": dpi}
+            if mode in ("Single Book", "Batch"):
+                cfg_json.update({"include_footers": include_footers, "zip_split_mb": zip_split_mb})
+            elif mode == "Raw Export":
+                cfg_json["zip_split_mb"] = zip_split_mb
+            elif mode == "Visual":
+                cfg_json.update({
+                    "detect_mode": detect_mode,
+                    "top_crop_pct": top_crop_pct,
+                    "bot_crop_pct": bot_crop_pct,
+                    "pad_px": pad_px,
+                    "run_ocr": run_ocr,
+                })
+                if run_ocr:
+                    cfg_json["engine"] = engine
+                    if engine == "claude":
+                        cfg_json["model"] = "claude-haiku-4-5-20251001"
+                    else:
+                        cfg_json.update({
+                            "nlbin_threshold": threshold_pct / 100,
+                            "text_direction": text_direction,
+                            "autocast": autocast,
+                            "pad": pad,
+                            "bidi_reordering": _BIDI_SHORT[bidi_key],
+                            "no_legacy_polygons": no_legacy_polygons,
+                            "temperature": temperature,
+                        })
+                    cfg_json["apply_corrections"] = apply_corrections
             st.json(cfg_json)
 
     return dict(
+        mode=mode,
         dpi=dpi,
+        include_footers=include_footers,
+        zip_split_mb=zip_split_mb,
         detect_mode=detect_mode,
         top_crop_pct=top_crop_pct,
         bot_crop_pct=bot_crop_pct,
@@ -641,16 +1156,18 @@ def _sidebar_settings() -> dict:
         no_legacy_polygons=no_legacy_polygons,
         temperature=temperature,
         apply_corrections=apply_corrections,
-        batch_mode=batch_mode,
-        batch_include_footers=batch_include_footers,
     )
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     st.set_page_config(page_title="Arabic PDF OCR", page_icon="\U0001f4c4", layout="wide")
     st.title("Arabic PDF OCR")
 
-    # Seed crop slider keys with defaults BEFORE _sidebar_settings() renders widgets.
+    # Seed Visual-mode crop slider keys before sidebar renders widgets.
     for _k, _d in [("top_crop_pct", 0), ("bot_crop_pct", 0), ("crop_pad_px", 20)]:
         if _k not in st.session_state:
             st.session_state[_k] = _d
@@ -661,20 +1178,34 @@ def main() -> None:
             st.session_state[_k] = st.session_state.pop(_pk)
 
     cfg = _sidebar_settings()
+    mode = cfg["mode"]
 
     uploaded_files = st.file_uploader(
         "Upload PDF file(s)", type=["pdf"], accept_multiple_files=True,
     )
     if not uploaded_files:
-        st.info(
-            "Upload a PDF to begin.  "
-            "Adjust the **Crop margins** sliders in the sidebar, then step through "
-            "each page to fine-tune the crop before downloading."
-        )
+        hints = {
+            "Single Book": (
+                "Upload a PDF to auto-detect and strip headers/footers, "
+                "then download all cropped pages as a colour-image ZIP."
+            ),
+            "Batch": (
+                "Upload one or more PDFs to process them all automatically."
+            ),
+            "Raw Export": (
+                "Upload a PDF to export all original pages as colour images "
+                "(no header/footer removal)."
+            ),
+            "Visual": (
+                "Upload a PDF to step through pages one-by-one and set crop "
+                "margins manually. Optional OCR is also available."
+            ),
+        }
+        st.info(hints.get(mode, "Upload a PDF to begin."))
         return
 
     for file_obj in uploaded_files:
-        # Cache raw bytes -- st.rerun() moves the UploadedFile cursor to EOF.
+        # Cache raw bytes — st.rerun() moves the UploadedFile cursor to EOF.
         pdf_cache_key = f"pdf_{file_obj.name}_{file_obj.size}"
         if pdf_cache_key not in st.session_state:
             raw = file_obj.read()
@@ -682,7 +1213,7 @@ def main() -> None:
                 st.session_state[pdf_cache_key] = raw
         pdf_bytes = st.session_state.get(pdf_cache_key)
         if not pdf_bytes:
-            st.error(f"Could not read '{file_obj.name}' -- please re-upload.")
+            st.error(f"Could not read '{file_obj.name}' — please re-upload.")
             continue
 
         file_hash = get_file_hash(pdf_bytes)
@@ -695,315 +1226,14 @@ def main() -> None:
             st.error(f"Could not read '{file_obj.name}': {exc}")
             continue
 
-        # =====================================================================
-        # BATCH EXPORT — one-click full pipeline (sidebar toggle).
-        # =====================================================================
-        if cfg["batch_mode"]:
-            batch_trig_key = f"batch_triggered_{file_hash}"
-            with st.expander(f"Batch Export — {file_obj.name}", expanded=True):
-                btn_col, info_col = st.columns([1, 4])
-                if btn_col.button("▶ Run", key=f"batch_btn_{file_hash}",
-                                  type="primary", use_container_width=True):
-                    st.session_state[batch_trig_key] = True
-                    st.rerun()
-                info_col.caption(
-                    "Strips headers/footers automatically, exports all pages as "
-                    "colour PNGs in a ZIP" +
-                    (", and builds a footnotes PDF." if cfg["batch_include_footers"]
-                     else ".")
-                )
+        if mode in ("Single Book", "Batch"):
+            _render_single_book_ui(pdf_bytes, file_hash, stem, total, cfg)
+        elif mode == "Raw Export":
+            _render_raw_export_ui(pdf_bytes, file_hash, stem, total, cfg)
+        elif mode == "Visual":
+            _render_visual_ui(pdf_bytes, file_hash, stem, total, cfg)
 
-                if st.session_state.get(batch_trig_key):
-                    with st.spinner(
-                        f"Running batch export for {file_obj.name} — "
-                        f"{total} page(s) at {cfg['dpi']} DPI…"
-                    ):
-                        zip_bytes, foot_bytes = _batch_export(pdf_bytes, cfg["dpi"])
-
-                    st.success(
-                        f"Done — {total} page(s) processed.",
-                        icon="✅",
-                    )
-                    show_footers = cfg["batch_include_footers"] and bool(foot_bytes)
-                    dl_cols = st.columns(2 if show_footers else 1)
-                    dl_cols[0].download_button(
-                        "⬇ Pages ZIP",
-                        data=zip_bytes,
-                        file_name=f"{stem}_pages.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                        key=f"batch_zip_{file_hash}",
-                    )
-                    if show_footers:
-                        dl_cols[1].download_button(
-                            "⬇ Footers PDF",
-                            data=foot_bytes,
-                            file_name=f"{stem}_footers.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                            key=f"batch_foot_{file_hash}",
-                        )
-                    elif cfg["batch_include_footers"] and not foot_bytes:
-                        st.info("No footnote sections were detected in this document.")
-            st.divider()
-
-        # -- Auto-detect margins (Fast mode: once per file on page 1) ---------
-        det_key = f"crop_det_{file_hash}"
-        if cfg["detect_mode"] == "Fast (page 1)" and det_key not in st.session_state:
-            with st.spinner("Detecting header/footer margins from page 1…"):
-                bw_p1 = _binarize_page(pdf_bytes, 1, cfg["dpi"], 50)
-                top_px_det, bot_px_det = _detect_margins(bw_p1)
-                h_p1 = Image.open(io.BytesIO(bw_p1)).height
-            st.session_state["_pending_top_crop_pct"] = min(75, round(top_px_det / h_p1 * 100))
-            st.session_state["_pending_bot_crop_pct"] = min(75, round(bot_px_det / h_p1 * 100))
-            st.session_state[det_key] = True
-            st.rerun()
-
-        # Wizard state --------------------------------------------------------
-        wiz_page_key = f"wiz_page_{file_hash}"
-        wiz_done_key = f"wiz_done_{file_hash}"
-        if wiz_page_key not in st.session_state:
-            st.session_state[wiz_page_key] = 1
-
-        # =====================================================================
-        # DOWNLOAD VIEW -- all pages cropped, optional OCR, download buttons.
-        # =====================================================================
-        if st.session_state.get(wiz_done_key, False):
-            # Each cropped page is written to a temp file immediately after
-            # cropping so the download data is always the exact cropped PNG,
-            # not whatever @st.cache_data happens to return on a rerun.
-            # The tmpdir is kept in session_state so it survives reruns.
-            tmpdir_key = f"tmpdir_{file_hash}"
-            if tmpdir_key not in st.session_state:
-                st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
-            tmpdir = st.session_state[tmpdir_key]
-
-            all_texts: list[str] = []
-
-            # Pre-allocate thumbnail grid (fills incrementally during the loop).
-            THUMB_COLS = 5
-            thumb_cols: list[list] = []
-            for row_start in range(0, total, THUMB_COLS):
-                n_in_row = min(THUMB_COLS, total - row_start)
-                thumb_cols.append(list(st.columns(n_in_row)))
-
-            prog = st.progress(0, text="Building images…")
-            png_paths: list[str] = []
-
-            for pn in range(1, total + 1):
-                prog.progress(pn / total, text=f"Page {pn} of {total}…")
-                png_path = os.path.join(tmpdir, f"page{pn:03d}.png")
-                png_paths.append(png_path)
-
-                pt = st.session_state.get(f"p_top_{file_hash}_{pn}", cfg["top_crop_pct"])
-                pb = st.session_state.get(f"p_bot_{file_hash}_{pn}", cfg["bot_crop_pct"])
-
-                # Write the cropped PNG once; reuse on subsequent reruns.
-                # Visited pages already have their file written by the wizard view.
-                if not os.path.exists(png_path):
-                    ob = _render_page_bytes(pdf_bytes, pn, cfg["dpi"])
-                    h  = Image.open(io.BytesIO(ob)).height
-                    cb = _apply_crop(ob, round(pt / 100 * h), round(pb / 100 * h),
-                                     cfg["pad_px"])
-                    with open(png_path, "wb") as fh:
-                        fh.write(cb)
-
-                with open(png_path, "rb") as fh:
-                    cb = fh.read()
-
-                # Fill thumbnail cell immediately (incremental display).
-                col = thumb_cols[(pn - 1) // THUMB_COLS][(pn - 1) % THUMB_COLS]
-                col.image(Image.open(io.BytesIO(cb)), width="stretch",
-                          caption=f"p.{pn}  ↑{pt}% ↓{pb}%")
-                col.download_button(
-                    f"↓ p.{pn}",
-                    data=cb,
-                    file_name=f"{stem}_page{pn:03d}.png",
-                    mime="image/png",
-                    key=f"dl_thumb_{file_hash}_{pn}",
-                )
-
-                text, confs = "", []
-                if cfg["run_ocr"]:
-                    if cfg["engine"] == "claude":
-                        try:
-                            text, confs = _ocr_page_claude(cb)
-                        except Exception:
-                            cfg["engine"] = "kraken"
-                    if cfg["engine"] == "kraken":
-                        try:
-                            _load_model()
-                            text, confs = _ocr_page(
-                                cb,
-                                threshold_pct=cfg["threshold_pct"],
-                                text_direction=cfg["text_direction"],
-                                autocast=cfg["autocast"],
-                                pad=cfg["pad"],
-                                bidi_key=cfg["bidi_key"],
-                                no_legacy_polygons=cfg["no_legacy_polygons"],
-                                temperature=cfg["temperature"],
-                            )
-                        except Exception:
-                            pass
-                    if cfg["apply_corrections"] and text:
-                        from confusables import apply_word_corrections
-                        text = apply_word_corrections(text, include_gt_derived=True)
-                all_texts.append(text)
-            prog.empty()
-
-            # Bulk download buttons -- builders read from temp files.
-            st.markdown("**Download all pages as:**")
-            n_cols = 4 if cfg["run_ocr"] else 3
-            dl_cols = st.columns(n_cols)
-            dl_cols[0].download_button(
-                "PDF",
-                data=_build_pdf(tuple(png_paths), cfg["dpi"]),
-                file_name=f"{stem}_cropped.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key=f"pdf_{file_hash}",
-            )
-            dl_cols[1].download_button(
-                "Multi-page TIFF",
-                data=_build_tiff(tuple(png_paths)),
-                file_name=f"{stem}_cropped.tiff",
-                mime="image/tiff",
-                use_container_width=True,
-                key=f"tiff_{file_hash}",
-            )
-            dl_cols[2].download_button(
-                "ZIP (PNG per page)",
-                data=_build_zip(tuple(png_paths), stem),
-                file_name=f"{stem}_cropped.zip",
-                mime="application/zip",
-                use_container_width=True,
-                key=f"zip_{file_hash}",
-            )
-            if cfg["run_ocr"]:
-                dl_cols[3].download_button(
-                    "TXT",
-                    data=_build_txt(tuple(all_texts), stem),
-                    file_name=f"{stem}.txt",
-                    mime="text/plain; charset=utf-8",
-                    use_container_width=True,
-                    key=f"txt_{file_hash}",
-                )
-
-            st.divider()
-            if st.button("← Back to page editor", key=f"back_{file_hash}"):
-                # Remove temp files so fresh crops are applied next time.
-                if tmpdir_key in st.session_state:
-                    shutil.rmtree(st.session_state.pop(tmpdir_key), ignore_errors=True)
-                st.session_state[wiz_done_key] = False
-                st.rerun()
-
-        # =====================================================================
-        # WIZARD VIEW -- one page at a time with crop sliders and navigation.
-        # =====================================================================
-        else:
-            current = st.session_state[wiz_page_key]
-
-            # Per-page crop keys -- initialise on first visit.
-            # Smart mode: run detect_margins() for this specific page.
-            # Other modes: use the global sidebar slider value.
-            p_top_key = f"p_top_{file_hash}_{current}"
-            p_bot_key = f"p_bot_{file_hash}_{current}"
-            if p_top_key not in st.session_state:
-                if cfg["detect_mode"] == "Smart (per page)":
-                    with st.spinner(f"Smart-detecting margins on page {current}…"):
-                        try:
-                            top_px, bot_px, h_det, _ = _detect_margins_v2(
-                                pdf_bytes, current, cfg["dpi"]
-                            )
-                            st.session_state[p_top_key] = min(75, round(top_px / h_det * 100))
-                            st.session_state[p_bot_key] = min(75, round(bot_px / h_det * 100))
-                        except Exception:
-                            st.session_state[p_top_key] = cfg["top_crop_pct"]
-                            st.session_state[p_bot_key] = cfg["bot_crop_pct"]
-                else:
-                    st.session_state[p_top_key] = cfg["top_crop_pct"]
-                    st.session_state[p_bot_key] = cfg["bot_crop_pct"]
-
-            # Crop sliders -- placed ABOVE the preview so the user sets values
-            # before reading the result.
-            st.caption(f"**Page {current} of {total}**")
-            sl_left, sl_right = st.columns(2)
-            sl_left.slider(
-                f"Top crop (%) -- page {current}", 0, 75, step=1,
-                key=p_top_key,
-                help="Rows to remove from the top of this page.",
-            )
-            sl_right.slider(
-                f"Bottom crop (%) -- page {current}", 0, 75, step=1,
-                key=p_bot_key,
-                help="Rows to remove from the bottom of this page.",
-            )
-
-            # Compute crop from the (possibly just-updated) slider values.
-            orig_bytes = _render_page_bytes(pdf_bytes, current, cfg["dpi"])
-            h_page   = Image.open(io.BytesIO(orig_bytes)).height
-            page_top = st.session_state[p_top_key]
-            page_bot = st.session_state[p_bot_key]
-            top_px   = round(page_top / 100 * h_page)
-            bot_px   = round(page_bot / 100 * h_page)
-            cropped_bytes = _apply_crop(orig_bytes, top_px, bot_px, cfg["pad_px"])
-
-            # Save to temp file immediately -- this exact PNG is what gets
-            # downloaded, so wizard preview and saved output are always identical.
-            tmpdir_key = f"tmpdir_{file_hash}"
-            if tmpdir_key not in st.session_state:
-                st.session_state[tmpdir_key] = tempfile.mkdtemp(prefix="ocr_me_")
-            _wiz_png = os.path.join(st.session_state[tmpdir_key],
-                                    f"page{current:03d}.png")
-            with open(_wiz_png, "wb") as _fh:
-                _fh.write(cropped_bytes)
-
-            # Preview: overlay left, cropped result right.
-            overlay_bytes = _draw_crop_overlay(orig_bytes, top_px, bot_px)
-            col_left, col_right = st.columns(2)
-            col_left.image(overlay_bytes, width="stretch",
-                           caption=f"Page {current} -- crop lines")
-            col_right.image(Image.open(io.BytesIO(cropped_bytes)),
-                            width="stretch",
-                            caption=f"Page {current} -- result")
-            col_right.download_button(
-                f"↓ Page {current} (PNG)",
-                data=cropped_bytes,
-                file_name=f"{stem}_page{current:03d}.png",
-                mime="image/png",
-                key=f"png_{file_hash}_{current}",
-            )
-
-            # Navigation row.
-            st.write("")
-            nav_prev, nav_mid, nav_next = st.columns([1, 2, 1])
-            with nav_prev:
-                if st.button("← Prev", disabled=(current == 1),
-                             key=f"prev_{file_hash}", use_container_width=True):
-                    st.session_state[wiz_page_key] = current - 1
-                    st.rerun()
-            with nav_mid:
-                if st.button(
-                    "⬇ Proceed to downloads",
-                    key=f"skip_{file_hash}",
-                    use_container_width=True,
-                    help="Use current crop settings for any un-visited pages and go to downloads.",
-                ):
-                    st.session_state[wiz_done_key] = True
-                    st.rerun()
-            with nav_next:
-                label = "Next →" if current < total else "✓ Done"
-                btn_type = "secondary" if current < total else "primary"
-                if st.button(label, key=f"next_{file_hash}",
-                             use_container_width=True, type=btn_type):
-                    if current < total:
-                        st.session_state[wiz_page_key] = current + 1
-                        st.rerun()
-                    else:
-                        st.session_state[wiz_done_key] = True
-                        st.rerun()
-
-            st.divider()
+        st.divider()
 
 
 if __name__ == "__main__":
