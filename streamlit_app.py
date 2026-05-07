@@ -384,146 +384,156 @@ def _estimate_pages_mb(n_pages: int, dpi: int) -> float:
     return n_pages * 4.0 * (dpi / 400) ** 2
 
 
-def _split_images_to_zips(
-    img_dir: Path,
+def _stream_pages_to_zips(
+    src_pdf: str,
     split_dir: Path,
     stem: str,
     max_mb: float,
+    dpi: int,
+    on_page=None,
 ) -> list[str]:
-    """Group sorted images in `img_dir` into ZIPs of at most `max_mb` MB each.
+    """Render PDF pages one at a time directly into split ZIP(s) — no intermediate PNGs on disk.
 
-    Single-chunk output keeps a clean name (`{stem}_pages.zip`).
-    Multi-chunk output uses `{stem}_pages_part_001.zip`, etc.
-    Returns list of written ZIP paths.
+    Each page's PNG bytes are written straight into the ZIP, then discarded.
+    Peak additional disk: only the growing current ZIP part (≤ max_mb).
+    on_page(page_num, total) is called after each page is added.
+    Single-chunk: `{stem}_pages.zip`; multi-chunk: `{stem}_pages_part_001.zip`, …
+    Returns list of final ZIP paths.
     """
+    import fitz as _fitz
+
     split_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted(img_dir.iterdir())
-    if not files:
-        return []
+    doc = _fitz.open(src_pdf)
+    n = doc.page_count
+    width = max(3, len(str(n)))
+    max_bytes = int(max_mb * 1024 * 1024)
 
-    max_bytes = max_mb * 1024 * 1024
-    chunks: list[list[Path]] = []
-    cur_chunk: list[Path] = []
+    tmp_paths: list[Path] = []
     cur_size = 0
+    cur_zf: zipfile.ZipFile | None = None
 
-    for f in files:
-        fsize = f.stat().st_size
-        if cur_chunk and cur_size + fsize > max_bytes:
-            chunks.append(cur_chunk)
-            cur_chunk = []
-            cur_size = 0
-        cur_chunk.append(f)
-        cur_size += fsize
-    if cur_chunk:
-        chunks.append(cur_chunk)
+    def _next_zip() -> None:
+        nonlocal cur_zf, cur_size
+        if cur_zf is not None:
+            cur_zf.close()
+        p = split_dir / f"__part_{len(tmp_paths) + 1:03d}.zip"
+        tmp_paths.append(p)
+        cur_zf = zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED)
+        cur_size = 0
 
-    zip_paths: list[str] = []
-    if len(chunks) == 1:
-        zip_path = split_dir / f"{stem}_pages.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in chunks[0]:
-                zf.write(f, arcname=f.name)
-        zip_paths.append(str(zip_path))
-    else:
-        for idx, chunk in enumerate(chunks, 1):
-            zip_path = split_dir / f"{stem}_pages_part_{idx:03d}.zip"
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for f in chunk:
-                    zf.write(f, arcname=f.name)
-            zip_paths.append(str(zip_path))
+    _next_zip()
+    try:
+        for i in range(n):
+            page = doc.load_page(i)
+            pix  = page.get_pixmap(dpi=dpi)
+            png  = pix.tobytes("png")
+            pix  = None          # release pixmap memory immediately
+            fname = f"page_{i + 1:0{width}d}.png"
+            if cur_size > 0 and cur_size + len(png) > max_bytes:
+                _next_zip()
+            cur_zf.writestr(fname, png)  # type: ignore[union-attr]
+            cur_size += len(png)
+            if on_page:
+                on_page(i + 1, n)
+    finally:
+        if cur_zf is not None:
+            cur_zf.close()
+        doc.close()
 
-    return zip_paths
-
-
-def _run_single_book(
-    pdf_bytes: bytes,
-    dpi: int,
-    include_footers: bool,
-    zip_split_mb: float,
-    tmpdir: str,
-    stem: str,
-) -> dict:
-    """Auto-detect pipeline: strip headers/footers, export pages, optionally extract footers.
-
-    Returns a dict with:
-      page_zips          — list of ZIP file paths (may be >1 if split)
-      footers_pdf        — path to labeled footers PDF, or None
-      footers_zip        — path to footer images ZIP, or None
-      n_pages_with_footers — int
-    """
-    from header_footer import strip_pdf, Params
-    from page_export import export_pages_as_images, extract_footers_pdf
-
-    p = Params(dpi=dpi)
-    td = Path(tmpdir)
-
-    src_path   = td / "input.pdf"
-    strip_path = td / "stripped.pdf"
-    img_dir    = td / "pages"
-    split_dir  = td / "zips"
-    foot_path  = td / "footers.pdf"
-
-    src_path.write_bytes(pdf_bytes)
-    strip_pdf(str(src_path), str(strip_path), p)
-    export_pages_as_images(str(strip_path), str(img_dir), dpi=dpi)
-
-    page_zips = _split_images_to_zips(img_dir, split_dir, stem, zip_split_mb)
-
-    # Free disk space used by individual PNGs after zipping.
-    for f in sorted(img_dir.iterdir()):
-        f.unlink()
-
-    foot_pages: list[int] = []
-    footers_zip_path: str | None = None
-    if include_footers:
-        foot_img_dir = td / "footer_imgs"
-        fzip = td / f"{stem}_footers_imgs.zip"
-        foot_pages = extract_footers_pdf(
-            str(src_path), str(foot_path), p=p,
-            img_dir=str(foot_img_dir),
-            images_dpi=dpi,
-            zip_path=str(fzip),
-        )
-        if foot_pages and fzip.exists():
-            footers_zip_path = str(fzip)
-
-    return {
-        "page_zips": page_zips,
-        "footers_pdf": str(foot_path) if include_footers and foot_pages and foot_path.exists() else None,
-        "footers_zip": footers_zip_path,
-        "n_pages_with_footers": len(foot_pages),
-    }
-
-
-def _run_raw_export(
-    pdf_bytes: bytes,
-    dpi: int,
-    zip_split_mb: float,
-    tmpdir: str,
-    stem: str,
-) -> list[str]:
-    """Export original (un-stripped) pages as colour images, split into ZIPs."""
-    from page_export import export_pages_as_images
-
-    td = Path(tmpdir)
-    src_path  = td / "input.pdf"
-    img_dir   = td / "pages"
-    split_dir = td / "zips"
-
-    src_path.write_bytes(pdf_bytes)
-    export_pages_as_images(str(src_path), str(img_dir), dpi=dpi)
-
-    zip_paths = _split_images_to_zips(img_dir, split_dir, stem, zip_split_mb)
-
-    for f in sorted(img_dir.iterdir()):
-        f.unlink()
-
-    return zip_paths
+    # Rename temp files to final names.
+    if len(tmp_paths) == 1:
+        final = split_dir / f"{stem}_pages.zip"
+        tmp_paths[0].rename(final)
+        return [str(final)]
+    final_paths: list[str] = []
+    for j, p in enumerate(tmp_paths, 1):
+        final = split_dir / f"{stem}_pages_part_{j:03d}.zip"
+        p.rename(final)
+        final_paths.append(str(final))
+    return final_paths
 
 
 # ---------------------------------------------------------------------------
 # Per-mode UI renderers
 # ---------------------------------------------------------------------------
+
+def _do_single_book(
+    pdf_bytes: bytes,
+    dpi: int,
+    include_footers: bool,
+    zip_split_mb: float,
+    tmpdir: Path,
+    stem: str,
+    total: int,
+) -> dict:
+    """Full pipeline with staged st.status progress updates.
+
+    Stages shown to the user:
+      1. Detect & strip margins (one low-DPI render per page via strip_pdf)
+      2. Stream render → ZIP(s) at export DPI with per-page progress bar
+      3. Extract footnote regions (optional)
+    Returns the same result dict as before.
+    """
+    from header_footer import strip_pdf, Params
+    from page_export import extract_footers_pdf
+
+    p = Params(dpi=dpi)
+    src_path   = tmpdir / "input.pdf"
+    strip_path = tmpdir / "stripped.pdf"
+    split_dir  = tmpdir / "zips"
+    foot_path  = tmpdir / "footers.pdf"
+
+    src_path.write_bytes(pdf_bytes)
+
+    with st.status("Processing…", expanded=True) as status:
+        st.write(f"⚙️ Detecting and stripping margins on {total} page(s)…")
+        strip_pdf(str(src_path), str(strip_path), p)
+
+        st.write(f"🖼 Rendering {total} page(s) at {dpi} DPI…")
+        prog = st.progress(0)
+
+        def _on_page(pg: int, n: int) -> None:
+            prog.progress(pg / n, text=f"Page {pg} of {n}")
+
+        page_zips = _stream_pages_to_zips(
+            str(strip_path), split_dir, stem, zip_split_mb, dpi, _on_page
+        )
+        prog.empty()
+
+        foot_pages: list[int] = []
+        footers_zip_path: str | None = None
+        if include_footers:
+            st.write("📑 Extracting footnote regions…")
+            foot_img_dir = tmpdir / "footer_imgs"
+            fzip = tmpdir / f"{stem}_footers_imgs.zip"
+            foot_pages = extract_footers_pdf(
+                str(src_path), str(foot_path), p=p,
+                img_dir=str(foot_img_dir),
+                images_dpi=dpi,
+                zip_path=str(fzip),
+            )
+            if foot_pages and fzip.exists():
+                footers_zip_path = str(fzip)
+
+        n_zips = len(page_zips)
+        n_foot = len(foot_pages)
+        status.update(
+            label=(
+                f"Done — {total} page(s) rendered"
+                + (f" into {n_zips} ZIP part{'s' if n_zips > 1 else ''}" if n_zips else "")
+                + (f", {n_foot} page(s) with footnotes" if include_footers else "")
+                + "."
+            ),
+            state="complete",
+        )
+
+    return {
+        "page_zips": page_zips,
+        "footers_pdf": str(foot_path) if include_footers and foot_pages and foot_path.exists() else None,
+        "footers_zip": footers_zip_path,
+        "n_pages_with_footers": n_foot,
+    }
+
 
 def _render_single_book_ui(
     pdf_bytes: bytes, file_hash: str, stem: str, total: int, cfg: dict,
@@ -552,17 +562,18 @@ def _render_single_book_ui(
         )
 
         if run_clicked:
-            tmpdir = tempfile.mkdtemp(prefix="sb_")
-            st.session_state[tmpdir_key] = tmpdir
-            with st.spinner(f"Processing {total} page(s) at {cfg['dpi']} DPI…"):
-                result = _run_single_book(
-                    pdf_bytes,
-                    cfg["dpi"],
-                    cfg["include_footers"],
-                    cfg["zip_split_mb"],
-                    tmpdir,
-                    stem,
+            tmpdir = Path(tempfile.mkdtemp(prefix="sb_"))
+            st.session_state[tmpdir_key] = str(tmpdir)
+            try:
+                result = _do_single_book(
+                    pdf_bytes, cfg["dpi"], cfg["include_footers"],
+                    cfg["zip_split_mb"], tmpdir, stem, total,
                 )
+            except Exception as exc:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+                st.session_state.pop(tmpdir_key, None)
+                st.error(f"Processing failed: {exc}")
+                return
             st.session_state[result_key] = result
             st.rerun()
     else:
@@ -622,6 +633,39 @@ def _render_single_book_ui(
             st.rerun()
 
 
+def _do_raw_export(
+    pdf_bytes: bytes,
+    dpi: int,
+    zip_split_mb: float,
+    tmpdir: Path,
+    stem: str,
+    total: int,
+) -> list[str]:
+    """Export original pages (un-stripped) to split ZIP(s) with per-page progress."""
+    src_path  = tmpdir / "input.pdf"
+    split_dir = tmpdir / "zips"
+    src_path.write_bytes(pdf_bytes)
+
+    with st.status("Exporting…", expanded=True) as status:
+        st.write(f"🖼 Rendering {total} page(s) at {dpi} DPI…")
+        prog = st.progress(0)
+
+        def _on_page(pg: int, n: int) -> None:
+            prog.progress(pg / n, text=f"Page {pg} of {n}")
+
+        zip_paths = _stream_pages_to_zips(
+            str(src_path), split_dir, stem, zip_split_mb, dpi, _on_page
+        )
+        prog.empty()
+        n_zips = len(zip_paths)
+        status.update(
+            label=f"Done — {total} page(s) exported into {n_zips} ZIP{'s' if n_zips > 1 else ''}.",
+            state="complete",
+        )
+
+    return zip_paths
+
+
 def _render_raw_export_ui(
     pdf_bytes: bytes, file_hash: str, stem: str, total: int, cfg: dict,
 ) -> None:
@@ -648,16 +692,17 @@ def _render_raw_export_ui(
         )
 
         if run_clicked:
-            tmpdir = tempfile.mkdtemp(prefix="re_")
-            st.session_state[tmpdir_key] = tmpdir
-            with st.spinner(f"Exporting {total} page(s) at {cfg['dpi']} DPI…"):
-                zip_paths = _run_raw_export(
-                    pdf_bytes,
-                    cfg["dpi"],
-                    cfg["zip_split_mb"],
-                    tmpdir,
-                    stem,
+            tmpdir = Path(tempfile.mkdtemp(prefix="re_"))
+            st.session_state[tmpdir_key] = str(tmpdir)
+            try:
+                zip_paths = _do_raw_export(
+                    pdf_bytes, cfg["dpi"], cfg["zip_split_mb"], tmpdir, stem, total
                 )
+            except Exception as exc:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+                st.session_state.pop(tmpdir_key, None)
+                st.error(f"Export failed: {exc}")
+                return
             st.session_state[result_key] = {"zip_paths": zip_paths}
             st.rerun()
     else:
