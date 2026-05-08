@@ -1232,8 +1232,8 @@ def _sidebar_settings() -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Arabic PDF OCR", page_icon="\U0001f4c4", layout="wide")
-    st.title("Arabic PDF OCR")
+    st.set_page_config(page_title="Arabic PDF2OCR", page_icon="\U0001f4c4", layout="wide")
+    st.title("Arabic PDF2OCR")
 
     # Seed Visual-mode crop slider keys before sidebar renders widgets.
     for _k, _d in [("top_crop_pct", 0), ("bot_crop_pct", 0), ("crop_pad_px", 20)]:
