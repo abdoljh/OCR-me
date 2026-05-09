@@ -338,14 +338,19 @@ def strip_pdf(
             m.page_index = i
             results.append(m)
             scale = 72.0 / p.dpi
-            pr = page.rect
+            pr = page.rect      # CropBox if set, else MediaBox (screen coords)
+            mb = page.mediabox  # always the full MediaBox; set_cropbox validates against this
             crop = fitz.Rect(
                 pr.x0 + m.keep_left * scale,
                 pr.y0 + m.keep_top * scale,
                 pr.x0 + (m.keep_right + 1) * scale,
                 pr.y0 + (m.keep_bottom + 1) * scale,
-            ) & pr
-            page.set_cropbox(crop)
+            ) & mb              # clamp to MediaBox, not CropBox, to satisfy set_cropbox
+            if not crop.is_empty:
+                try:
+                    page.set_cropbox(crop)
+                except Exception:
+                    pass        # leave page uncropped rather than abort the whole document
             if on_page:
                 on_page(i + 1, n)
         src.save(out_path, garbage=4, deflate=True)
