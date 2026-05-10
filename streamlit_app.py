@@ -247,8 +247,7 @@ def _ocr_page(
                 cli_stderr = "CLI timed out (>300 s)"
 
     if cli_stderr:
-        import streamlit as _st
-        _st.warning(f"kraken CLI failed -- using Python API fallback.\n\n```\n{cli_stderr}\n```")
+        st.warning(f"kraken CLI failed — using Python API fallback.\n\n```\n{cli_stderr}\n```")
 
     from kraken import blla, binarization as _kbin, rpred as krpred
     model = _load_model()
@@ -353,15 +352,16 @@ def _build_pdf(png_paths: tuple[str, ...], dpi: int) -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def _build_tiff(png_paths: tuple[str, ...]) -> bytes:
+def _build_tiff(png_paths: tuple[str, ...], dpi: int) -> bytes:
     images = []
     for path in png_paths:
         img = Image.open(path).convert("L")
         w, h = img.size
         images.append(img.resize((w // 2, h // 2), Image.LANCZOS))
     buf = io.BytesIO()
+    half_dpi = dpi // 2
     images[0].save(buf, format="TIFF", save_all=True, append_images=images[1:],
-                   compression="tiff_deflate")
+                   compression="tiff_deflate", dpi=(half_dpi, half_dpi))
     return buf.getvalue()
 
 
@@ -908,7 +908,7 @@ def _render_visual_ui(
         )
         dl_cols[1].download_button(
             "Multi-page TIFF",
-            data=_build_tiff(tuple(png_paths)),
+            data=_build_tiff(tuple(png_paths), cfg["dpi"]),
             file_name=f"{stem}_cropped.tiff",
             mime="image/tiff",
             use_container_width=True,

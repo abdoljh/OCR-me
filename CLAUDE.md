@@ -21,17 +21,21 @@ lightning-compat/         Local pip package that shims the quarantined `lightnin
   lightning/__init__.py
   lightning/fabric/__init__.py
 confusables.py            Post-OCR Arabic word-correction dictionary + apply fn
-analyse_confusables.py    CLI tool: align OCR output vs ground truth, report errors
-test_kraken.py            CLI: compare kraken vs Tesseract accuracy on sample pages
 DEPLOYMENT.md             Full deployment guide (Streamlit Cloud pitfalls, shim docs)
 samples/                  Arabic PDF test files + ground-truth text
   arabic01.pdf … arabic05.pdf
   Preface.pdf, Preface_3_22.pdf
   Preface_1-10.txt          (ground truth for Preface.pdf pages 1–10)
-ground_truth.txt          Ground truth for arabic01.pdf pages 5–10
-kraken/
+kraken_docs/
   KRAKEN_ARTICLE.md       Technical article: kraken architecture + Arabic evaluation
-  arabic01.txt            Raw OCR output from arabic01.pdf (for analysis)
+  input.jpg               Sample input image for the article
+misc/                     Dev/research tools not used by the production app
+  analyse_confusables.py  CLI tool: align OCR output vs ground truth, report errors
+  test_kraken.py          CLI: compare kraken vs Tesseract accuracy on sample pages
+  post_process.py         OCR text post-processing pipeline (future integration)
+  prep_inputs.py          One-time script: extract pages 5-10 from raw OCR output
+  textcleaner             Bash script for text cleaning (unrelated to main pipeline)
+  Sample_cropped.pdf      Sample cropped output for reference
 ```
 
 ---
