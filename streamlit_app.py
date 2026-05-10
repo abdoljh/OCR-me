@@ -507,6 +507,7 @@ def _do_single_book(
     pdf_bytes: bytes,
     dpi: int,
     include_footers: bool,
+    include_photos: bool,
     zip_split_mb: float,
     tmpdir: Path,
     stem: str,
@@ -518,10 +519,11 @@ def _do_single_book(
       1. Detect & strip margins (one low-DPI render per page via strip_pdf)
       2. Stream render → ZIP(s) at export DPI with per-page progress bar
       3. Extract footnote regions (optional)
-    Returns the same result dict as before.
+      4. Extract photographs (optional)
     """
     from header_footer import strip_pdf, Params
     from page_export import extract_footers_pdf
+    from image_extract import extract_images
 
     p = Params(dpi=dpi)
     src_path   = tmpdir / "input.pdf"
@@ -574,6 +576,30 @@ def _do_single_book(
             if foot_pages and fzip.exists():
                 footers_zip_path = str(fzip)
 
+        photos_zip_path: str | None = None
+        n_photos = 0
+        if include_photos:
+            st.write("📷 Extracting photographs…")
+            prog4 = st.progress(0)
+
+            def _on_photo(pg: int, n: int) -> None:
+                prog4.progress(pg / n, text=f"Page {pg} of {n}")
+
+            photo_dir = tmpdir / "photos"
+            pzip = tmpdir / f"{stem}_photos.zip"
+            photo_results = extract_images(
+                str(src_path), str(photo_dir),
+                dpi=dpi,
+                with_captions=True,
+                use_body_crop=True,
+                zip_path=str(pzip),
+                on_page=_on_photo,
+            )
+            prog4.empty()
+            n_photos = sum(len(r.photos) for r in photo_results)
+            if n_photos and pzip.exists():
+                photos_zip_path = str(pzip)
+
         n_zips = len(page_zips)
         n_foot = len(foot_pages)
         status.update(
@@ -581,6 +607,7 @@ def _do_single_book(
                 f"Done — {total} page(s) rendered"
                 + (f" into {n_zips} ZIP part{'s' if n_zips > 1 else ''}" if n_zips else "")
                 + (f", {n_foot} page(s) with footnotes" if include_footers else "")
+                + (f", {n_photos} photograph{'s' if n_photos != 1 else ''} extracted" if include_photos else "")
                 + "."
             ),
             state="complete",
@@ -591,6 +618,8 @@ def _do_single_book(
         "footers_pdf": str(foot_path) if include_footers and foot_pages and foot_path.exists() else None,
         "footers_zip": footers_zip_path,
         "n_pages_with_footers": n_foot,
+        "photos_zip": photos_zip_path,
+        "n_photos": n_photos,
     }
 
 
@@ -615,9 +644,14 @@ def _render_single_book_ui(
             type="primary",
             use_container_width=True,
         )
+        extras = []
+        if cfg["include_footers"]:
+            extras.append("footnotes")
+        if cfg["include_photos"]:
+            extras.append("photographs")
         col_info.caption(
             "Strips headers/footers automatically and exports all pages as colour PNGs."
-            + (" Extracts footer regions too." if cfg["include_footers"] else "")
+            + (f" Also extracts {' and '.join(extras)}." if extras else "")
         )
 
         if run_clicked:
@@ -626,7 +660,7 @@ def _render_single_book_ui(
             try:
                 result = _do_single_book(
                     pdf_bytes, cfg["dpi"], cfg["include_footers"],
-                    cfg["zip_split_mb"], tmpdir, stem, total,
+                    cfg["include_photos"], cfg["zip_split_mb"], tmpdir, stem, total,
                 )
             except Exception as exc:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
@@ -639,10 +673,14 @@ def _render_single_book_ui(
         result = st.session_state[result_key]
         n_zips = len(result["page_zips"])
         n_foot = result["n_pages_with_footers"]
+        n_photos = result.get("n_photos", 0)
         st.success(
             f"Done — {total} page(s) processed"
             + (f", {n_zips} ZIP part{'s' if n_zips > 1 else ''}" if n_zips else "")
-            + (f", {n_foot} page(s) with footnotes." if cfg["include_footers"] else "."),
+            + (f", {n_foot} page(s) with footnotes" if cfg["include_footers"] else "")
+            + (f", {n_photos} photograph{'s' if n_photos != 1 else ''} extracted"
+               if cfg["include_photos"] else "")
+            + ".",
             icon="✅",
         )
 
@@ -651,9 +689,13 @@ def _render_single_book_ui(
             dl_files.append({"path": result["footers_pdf"], "mime": "application/pdf"})
         if result.get("footers_zip"):
             dl_files.append({"path": result["footers_zip"], "mime": "application/zip"})
+        if result.get("photos_zip"):
+            dl_files.append({"path": result["photos_zip"], "mime": "application/zip"})
         _render_download_selector(dl_files, file_hash, "sb")
         if cfg["include_footers"] and not n_foot:
             st.info("No footnote sections were detected in this document.")
+        if cfg["include_photos"] and not n_photos:
+            st.info("No photographs were detected in this document.")
 
         if st.button("↺ Reset", key=f"sb_reset_{file_hash}"):
             tmpdir = st.session_state.pop(tmpdir_key, None)
@@ -1027,6 +1069,7 @@ def _sidebar_settings() -> dict:
 
         # Defaults for options not rendered in the current mode.
         include_footers = False
+        include_photos  = False
         zip_split_mb    = float(ZIP_SPLIT_DEFAULT_MB)
         detect_mode     = "Off"
         top_crop_pct    = 0
@@ -1052,6 +1095,17 @@ def _sidebar_settings() -> dict:
                 help=(
                     "Assemble all detected footnote sections into a labeled PDF "
                     "and a separate image ZIP."
+                ),
+            )
+            include_photos = st.checkbox(
+                "Extract photographs",
+                value=False,
+                key="include_photos",
+                help=(
+                    "Detect photographic regions and their captions in each page "
+                    "and save them as individual PNGs in a ZIP. Uses pixel-domain "
+                    "dark-region segmentation — works even when the PDF has no "
+                    "embedded image objects."
                 ),
             )
             zip_split_mb = float(st.number_input(
@@ -1177,7 +1231,9 @@ def _sidebar_settings() -> dict:
         with st.expander("Active configuration", expanded=False):
             cfg_json: dict = {"mode": mode, "dpi": dpi}
             if mode in ("Single Book", "Batch"):
-                cfg_json.update({"include_footers": include_footers, "zip_split_mb": zip_split_mb})
+                cfg_json.update({"include_footers": include_footers,
+                                 "include_photos": include_photos,
+                                 "zip_split_mb": zip_split_mb})
             elif mode == "Raw Export":
                 cfg_json["zip_split_mb"] = zip_split_mb
             elif mode == "Visual":
@@ -1209,6 +1265,7 @@ def _sidebar_settings() -> dict:
         mode=mode,
         dpi=dpi,
         include_footers=include_footers,
+        include_photos=include_photos,
         zip_split_mb=zip_split_mb,
         detect_mode=detect_mode,
         top_crop_pct=top_crop_pct,
