@@ -251,9 +251,8 @@ has been lifted.
 streamlit_app.py          Main Streamlit application
 header_footer.py          Margin-detection & CropBox pipeline (Params, detect_margins, strip_pdf)
 page_export.py            Page/footer image export utilities (export_pages_as_images, extract_footers_pdf)
+image_extract.py          Photograph extraction pipeline (extract_images)
 confusables.py            Post-OCR Arabic word-correction dictionary
-analyse_confusables.py    CLI: align OCR output vs ground truth, report character confusions
-test_kraken.py            CLI: compare kraken vs Tesseract accuracy on sample pages
 packages.txt              apt packages for Streamlit Cloud (poppler-utils)
 requirements.txt          Production Python dependencies
 requirements-dev.txt      Adds pytesseract for local testing
@@ -266,10 +265,16 @@ samples/                  Arabic PDF test files and ground-truth text
   arabic01.pdf … arabic05.pdf
   Preface.pdf, Preface_3_22.pdf
   Preface_1-10.txt          Ground truth for Preface.pdf pages 1–10
-ground_truth.txt          Ground truth for arabic01.pdf pages 5–10
-kraken/
+kraken_docs/
   KRAKEN_ARTICLE.md       Technical article: kraken architecture + Arabic evaluation
-  arabic01.txt            Raw OCR output from arabic01.pdf (for analysis)
+  input.jpg               Sample input image for the article
+misc/                     Dev/research tools not used by the production app
+  analyse_confusables.py  CLI: align OCR output vs ground truth, report character confusions
+  test_kraken.py          CLI: compare kraken vs Tesseract accuracy on sample pages
+  post_process.py         OCR text post-processing pipeline (future integration)
+  prep_inputs.py          One-time script for ground-truth data extraction
+  textcleaner             Bash script for text cleaning (unrelated to main pipeline)
+  Sample_cropped.pdf      Sample cropped output for reference
 ```
 
 ---
@@ -277,19 +282,18 @@ kraken/
 ## Accuracy benchmarking
 
 ```bash
-python test_kraken.py ~/.kraken_models/apt-20221130.mlmodel samples/arabic01.pdf
+python misc/test_kraken.py ~/.kraken_models/apt-20221130.mlmodel samples/arabic01.pdf
 ```
 
 Compares kraken against Tesseract on the same pages and prints a CER/WER
 table. Requires `requirements-dev.txt`.
 
 ```bash
-python analyse_confusables.py
+python misc/analyse_confusables.py
 ```
 
-Aligns raw kraken output (`kraken/arabic01.txt`) against `ground_truth.txt`,
-produces a character-confusion frequency table, and regenerates the correction
-dictionary used by `confusables.py`.
+Aligns raw kraken output against `ground_truth.txt`, produces a character-confusion
+frequency table, and regenerates the correction dictionary used by `confusables.py`.
 
 ---
 
